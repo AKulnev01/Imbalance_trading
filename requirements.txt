@@ -1,0 +1,14 @@
+python-binance
+pandas
+openpyxl
+schedule
+python-telegram-bot
+cryptography
+dotenv
+python-dotenv
+numpy
+aiohttp
+requests
+websockets
+matplotlib
+python-telegram-bot==13.*

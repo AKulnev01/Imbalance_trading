@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual env
+.venv/
+env/
+venv/
+
+# Logs
+*.log
+logs/
+
+# Env files
+.env
+*.env
+
+# State / cache
+autotrade_state.json
+*.sqlite
+*.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# System
+.DS_Store
+Thumbs.db
