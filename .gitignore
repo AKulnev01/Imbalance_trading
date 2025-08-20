@@ -33,3 +33,6 @@ autotrade_state.json
 # System
 .DS_Store
 Thumbs.db
+.idea/
+signals.xlsx
+pending_orders_state.json
