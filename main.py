@@ -56,6 +56,9 @@ from config import (
     TRADE_UNIVERSE,                # фиксированный список монет (как в бою)
     DEFAULT_MIN_STRENGTH,          # мин. сила FVG
     RISK_REWARD_RATIO,             # для вычисления TP
+    ENTRY_MODE,                # <-- добавь
+    MOMENTUM_TP_PCT,          # <-- добавь
+    MOMENTUM_SL_PCT,
 )
 
 from utils.fetch_data import get_bybit_klines
@@ -177,12 +180,22 @@ def bulk_closed_report(days: int = 90, interval: Optional[str] = None, max_days_
                 side = str(imb["type"]).upper()
                 entry = float(imb["low2"] if side == "BUY" else imb["high2"])
 
-                if side == "BUY":
-                    stop = float(imb["low2"]) * 0.998
-                    tp   = float(entry) + (float(entry) - float(stop)) * float(RISK_REWARD_RATIO)
+                if ENTRY_MODE == "MOMENTUM":
+                    # TP/SL из .env
+                    if side == "BUY":
+                        stop = float(entry) * (1.0 - float(MOMENTUM_SL_PCT))
+                        tp = float(entry) * (1.0 + float(MOMENTUM_TP_PCT))
+                    else:  # SELL
+                        stop = float(entry) * (1.0 + float(MOMENTUM_SL_PCT))
+                        tp = float(entry) * (1.0 - float(MOMENTUM_TP_PCT))
                 else:
-                    stop = float(imb["high2"]) * 1.002
-                    tp   = float(entry) - (float(stop) - float(entry)) * float(RISK_REWARD_RATIO)
+                    # Старый подход через RR для ретест/брейкаут отчётов
+                    if side == "BUY":
+                        stop = float(imb["low2"]) * 0.998
+                        tp = float(entry) + (float(entry) - float(stop)) * float(RISK_REWARD_RATIO)
+                    else:
+                        stop = float(imb["high2"]) * 1.002
+                        tp = float(entry) - (float(stop) - float(entry)) * float(RISK_REWARD_RATIO)
 
                 t0 = pd.to_datetime(imb["time"], utc=True)
                 fill_time = t0 + pd.Timedelta(days=int(dfill))
@@ -251,12 +264,22 @@ def bulk_open_report(days: int = 30, interval: Optional[str] = None) -> str:
                     continue
 
                 entry = float(imb["low2"] if side == "BUY" else imb["high2"])
-                if side == "BUY":
-                    stop = float(imb["low2"]) * 0.998
-                    tp   = float(entry) + (float(entry) - float(stop)) * float(RISK_REWARD_RATIO)
+                if ENTRY_MODE == "MOMENTUM":
+                    # TP/SL из .env
+                    if side == "BUY":
+                        stop = float(entry) * (1.0 - float(MOMENTUM_SL_PCT))
+                        tp = float(entry) * (1.0 + float(MOMENTUM_TP_PCT))
+                    else:  # SELL
+                        stop = float(entry) * (1.0 + float(MOMENTUM_SL_PCT))
+                        tp = float(entry) * (1.0 - float(MOMENTUM_TP_PCT))
                 else:
-                    stop = float(imb["high2"]) * 1.002
-                    tp   = float(entry) - (float(stop) - float(entry)) * float(RISK_REWARD_RATIO)
+                    # Старый подход через RR для ретест/брейкаут отчётов
+                    if side == "BUY":
+                        stop = float(imb["low2"]) * 0.998
+                        tp = float(entry) + (float(entry) - float(stop)) * float(RISK_REWARD_RATIO)
+                    else:
+                        stop = float(imb["high2"]) * 1.002
+                        tp = float(entry) - (float(stop) - float(entry)) * float(RISK_REWARD_RATIO)
 
                 t0 = pd.to_datetime(imb["time"], utc=True)
 
@@ -327,12 +350,22 @@ def bulk_all_report(days: int = 360, interval: Optional[str] = None) -> str:
                     continue
 
                 entry = float(imb["low2"] if side == "BUY" else imb["high2"])
-                if side == "BUY":
-                    stop = float(imb["low2"]) * 0.998
-                    tp   = float(entry) + (float(entry) - float(stop)) * float(RISK_REWARD_RATIO)
+                if ENTRY_MODE == "MOMENTUM":
+                    # TP/SL из .env
+                    if side == "BUY":
+                        stop = float(entry) * (1.0 - float(MOMENTUM_SL_PCT))
+                        tp = float(entry) * (1.0 + float(MOMENTUM_TP_PCT))
+                    else:  # SELL
+                        stop = float(entry) * (1.0 + float(MOMENTUM_SL_PCT))
+                        tp = float(entry) * (1.0 - float(MOMENTUM_TP_PCT))
                 else:
-                    stop = float(imb["high2"]) * 1.002
-                    tp   = float(entry) - (float(stop) - float(entry)) * float(RISK_REWARD_RATIO)
+                    # Старый подход через RR для ретест/брейкаут отчётов
+                    if side == "BUY":
+                        stop = float(imb["low2"]) * 0.998
+                        tp = float(entry) + (float(entry) - float(stop)) * float(RISK_REWARD_RATIO)
+                    else:
+                        stop = float(imb["high2"]) * 1.002
+                        tp = float(entry) - (float(stop) - float(entry)) * float(RISK_REWARD_RATIO)
 
                 t0 = pd.to_datetime(imb["time"], utc=True)
 

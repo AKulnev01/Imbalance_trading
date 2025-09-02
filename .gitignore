@@ -36,3 +36,6 @@ Thumbs.db
 .idea/
 signals.xlsx
 pending_orders_state.json
+
+# Blocklist (runtime)
+blocklist_symbols.txt

@@ -1,0 +1,20 @@
+{
+  "processed_ids": [],
+  "open_positions": {
+    "A2ZUSDT_1756785600": {
+      "symbol": "A2ZUSDT",
+      "side": "BUY",
+      "detect_px": 0.006207,
+      "fill_px": null,
+      "tp": 0.00639321,
+      "sl": 0.00614493,
+      "mode": "entry",
+      "bar_open": "2025-09-02T00:00:00+00:00",
+      "bar_close": "2025-09-02T04:00:00+00:00",
+      "placed_at": "2025-09-02T04:00:09.533426+00:00",
+      "close_deadline": "2025-09-09T04:00:07.990231+00:00",
+      "usd_alloc": 388.7647776
+    }
+  },
+  "kv": {}
+}

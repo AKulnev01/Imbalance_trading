@@ -84,6 +84,11 @@ _LAST_ENV_READ_TS = 0.0
 
 _BYBIT_DEBUG = os.getenv("BYBIT_DEBUG", "0").lower() in ("1", "true", "yes")
 
+# --- Blocklist (auto "panic-button") ---
+BLOCKLIST_PATH = os.getenv("BLOCKLIST_PATH", "blocklist_symbols.txt")
+_blocklist: set = set()
+_blocklist_mtime: Optional[float] = None
+
 def _next_4h_close_utc(now: Optional[pd.Timestamp] = None) -> Tuple[pd.Timestamp, pd.Timedelta]:
     """Ближайшее закрытие 4h-бара (UTC) и оставшееся время."""
     now = now or pd.Timestamp.utcnow()
@@ -101,6 +106,29 @@ def _timedelta_str(td: pd.Timedelta) -> str:
     m = (total % 3600) // 60
     s = total % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+def _load_blocklist_if_changed():
+    """Читает blocklist_symbols.txt если файл изменился. Формат: по одному символу в строке, можно комментарии с #."""
+    import os
+    global _blocklist, _blocklist_mtime
+    try:
+        if not os.path.exists(BLOCKLIST_PATH):
+            return
+        mt = os.path.getmtime(BLOCKLIST_PATH)
+        if _blocklist_mtime is not None and mt == _blocklist_mtime:
+            return  # без изменений
+        _blocklist_mtime = mt
+        new_set = set()
+        with open(BLOCKLIST_PATH, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                new_set.add(line.upper())
+        _blocklist = new_set
+        log.info(f"[BLOCKLIST] loaded {len(_blocklist)} symbols from {BLOCKLIST_PATH}: {sorted(list(_blocklist))[:8]}{' …' if len(_blocklist)>8 else ''}")
+    except Exception as e:
+        log.warning(f"[BLOCKLIST] read failed: {e}")
 
 def _reload_env_if_needed():
     """Периодически перечитываем .env и обновляем рантайм-настройки без рестарта. Логируем ETA до закрытия 4h бара."""
@@ -161,6 +189,12 @@ def _reload_env_if_needed():
     except Exception as e:
         _LAST_ENV_READ_TS = now
         log.warning(f"[ENV] reload failed: {e}")
+
+    # ... существующий лог
+    _load_blocklist_if_changed()
+    if _blocklist:
+        log.info(
+            f"[ENV] blocklisted={len(_blocklist)} → {','.join(sorted(list(_blocklist))[:10])}{'…' if len(_blocklist) > 10 else ''}")
 
 # WS endpoints v5
 WS_MAIN_SPOT   = "wss://stream.bybit.com/v5/public/spot"
@@ -272,6 +306,9 @@ async def _place_limit_order(symbol: str, side_raw: str, entry: float, tp: float
     Постановка лимитки с учётом аллокатора. Резервируем кэш сразу.
     Возвращает (ok, reason_if_failed).
     """
+    if symbol.upper() in _blocklist:
+        log.info(f"[LIMIT_SKIP] {symbol}: blocked by news")
+        return False, "blocked_by_news"
     from utils.bybit_trade import create_order, usd_to_qty
 
     # 1) запросить аллокацию (резерв)
@@ -369,6 +406,9 @@ def _atr(series_h, series_l, series_c, n=14):
     return tr.rolling(n, min_periods=1).mean()
 
 async def _enter_momentum_market(symbol: str, side_raw: str, px: float, t0: pd.Timestamp):
+    if symbol.upper() in _blocklist:
+        log.info(f"[MOM_SKIP] {symbol}: blocked by news")
+        return False
     # аллокация
     batch_time = pd.Timestamp.utcnow()
     close_deadline = batch_time + pd.Timedelta(days=DEFAULT_TTL_DAYS)
@@ -408,6 +448,9 @@ async def _enter_breakout_market(symbol: str, side_raw: str, c_close: float, imb
     BREAKOUT: открываемся MARKET сразу на закрытии бара с имбом.
     SL/TP считаем от фактической «entry≈close». ENTRY_OFFSET_PCT логируем как информативный таргет (но не ждём).
     """
+    if symbol.upper() in _blocklist:
+        log.info(f"[BRK_SKIP] {symbol}: blocked by news")
+        return False
     # аллокация «на сейчас»
     batch_time = pd.Timestamp.utcnow()
     close_deadline = batch_time + pd.Timedelta(days=DEFAULT_TTL_DAYS)
@@ -462,6 +505,9 @@ async def on_candle_closed(symbol: str):
         - детект «глубокой свечи» по ATR/объёму и вход MARKET.
         - backfill не используется.
     """
+    if symbol.upper() in _blocklist:
+        log.info(f"[FVG_SKIP] {symbol}: blocked by news")
+        return
     arr = _candles.get(symbol, [])
     if len(arr) < 10:
         log.info(f"[BAR_CLOSE] {symbol}: bars={len(arr)} (<10) — пропуск детекта")
@@ -1071,8 +1117,15 @@ async def main():
         await tg("🚀 Realtime автоторговля запущена (WS 4h FVG, RETEST/BREAKOUT/MOMENTUM, LTF-touch, датовый бэкфилл, аллокатор, мониторинг).")
 
     symbols = list(dict.fromkeys(TRADE_UNIVERSE))
+
+    # ⛔️ NEW: подгрузим blocklist и отфильтруем юниверс
+    _load_blocklist_if_changed()
+    if _blocklist:
+        symbols = [s for s in symbols if s.upper() not in _blocklist]
+        log.info(f"[BLOCKLIST] filtered universe: {len(symbols)} symbols active (blocked={len(_blocklist)})")
+
     if not symbols:
-        log.warning("TRADE_UNIVERSE is empty — проверь config.py.")
+        log.warning("TRADE_UNIVERSE is empty — проверь config.py и blocklist.")
         symbols = []
     else:
         log.info(f"Universe size = {len(symbols)} (из TRADE_UNIVERSE)")
