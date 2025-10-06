@@ -1,0 +1,24 @@
+exchange:
+  name: bybit
+  category: spot
+  symbols: ["A2ZUSDT","BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT"]
+marketdata:
+  store: "parquet"
+  parquet_dir: "./data/m1"
+  fetch_lookback_days: 3
+  max_batch_minutes: 1000
+costs:
+  taker_fee_bps: 10.0
+  maker_fee_bps: 1.0
+  half_spread_bps_default: 3.0
+slippage_model:
+  a_bps: 2.0
+  b_bps_per_vol: 0.8
+  c_bps_per_liq_ratio: 1.2
+  liq_floor_usd: 50000
+evaluation:
+  rr_tp_list: [3.0, 4.0, 5.0]
+  rr_sl_list: [1.0, 1.5, 2.0]
+  ttl_hours_list: [8, 12, 24, 48]
+  intra_bar_policy: "pessimistic"
+  tz: "UTC"

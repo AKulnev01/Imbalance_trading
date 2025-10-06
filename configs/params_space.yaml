@@ -1,0 +1,19 @@
+risk:
+  tp_rr: [1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+  sl_rr: [0.8, 1.0, 1.2, 1.5]
+  ttl_hours: [8, 12, 24, 48, 72]
+entry:
+  confirm_candles_4h: [0, 1, 2]
+  mkt_order: [true, false]
+  max_slippage_bp: [5, 10, 20, 35]
+exit:
+
+  trail_type: [none, atr, swing]
+  trail_mult: [1.0, 1.5, 2.0]
+filters:
+  min_spread_bp: [3, 5, 8, 12]
+  min_liquidity_usd: [20000, 50000, 100000]
+  volatility_lookback_h: [12, 24, 48]
+  session: [any, asia, eu, us]
+universe:
+  symbols: ["BTCUSDT","ETHUSDT","A2ZUSDT","SOLUSDT","XRPUSDT"]
