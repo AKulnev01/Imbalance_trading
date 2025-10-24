@@ -535,7 +535,7 @@ async def rest_close_scanner_loop():
             await _sleep_until(target)
 
             # оценим дрейф запуска
-            started_at = pd.Timestamp.utcnow().tz_localize("UTC")
+            started_at = pd.Timestamp.utcnow().tz_convert("UTC")
             drift = (started_at - target).total_seconds()
             if drift > 2.0:  # больше 2 сек — предупредить
                 log.warning(f"[REST_CLOSE] delayed start by {drift:.2f}s (target={target}, started={started_at})")
@@ -649,41 +649,70 @@ async def rest_close_scanner_loop():
 
 async def rest_catchup_once():
     """
-    Если последний закрытый 4h-бар ещё не обработан, обработаем его сразу.
+    Стартовый catch-up: ТОЛЬКО логируем наличие сигналов на последнем закрытом 4h-баре
+    и помечаем бар обработанным. НИКАКИХ входов.
     """
     try:
-        close_ts = pd.Timestamp.utcnow().tz_localize("UTC")
-        hour = (close_ts.hour // 4) * 4
-        close_ts = close_ts.replace(hour=hour, minute=0, second=0, microsecond=0)
+        # последний закрытый 4h-бар
+        now = pd.Timestamp.utcnow().tz_convert("UTC")
+        hour = (now.hour // 4) * 4
+        close_ts = now.replace(hour=hour, minute=0, second=0, microsecond=0)
         expected_open = (close_ts - pd.Timedelta(hours=4)).tz_convert("UTC")
 
-        # если прямо сейчас ровно на границе (секунды ~0) — подождём чуть-чуть, чтобы Bybit успел отдать бар
-        if (pd.Timestamp.utcnow().second < 3):
+        # маленькая задержка, если старт пришёл аккурат на границе
+        if pd.Timestamp.utcnow().second < 3:
             await asyncio.sleep(3)
 
         syms_linear = [s for s, cat in SYMBOL_CATEGORY.items() if cat == "linear"]
         syms_spot   = [s for s, cat in SYMBOL_CATEGORY.items() if cat == "spot"]
 
         async def _run(symbols, category):
+            if not symbols:
+                return 0, []
+            found = 0
+            lines = []
             async with _make_session() as session:
                 for sym in symbols:
                     try:
                         df = await _fetch_4h_df(session, sym, category, limit=min(MAX_CANDLES, 120))
-                        if df is None or df.empty: continue
+                        if df is None or df.empty:
+                            continue
+
                         dfs = _slice_to_closed_bar(df, expected_open)
                         if dfs is None or dfs.empty or dfs.index[-1] != expected_open:
+                            # данных по этому бару нет — ничего не отмечаем
                             continue
+
                         args = _pick_and_enter_args(dfs, sym)
-                        if args is None: continue
+                        # ПО-ЛЮБОМУ считаем бар обработанным (чтобы не войти на следующем проходе)
+                        _last_done[sym] = expected_open
+
+                        if args is None:
+                            continue
+
                         bar_open, bar_close, detect_px, side, strength = args
-                        if not _positions_limit_ok(category): continue
-                        await _enter_momentum_market(sym, side, detect_px, bar_open, bar_close, strength=strength)
+                        found += 1
+                        lines.append(
+                            f"ℹ️ CATCH-UP: {sym} {side} | detect={detect_px:.6f} | сила={strength:.2f} "
+                            f"| бар {bar_open.tz_convert('UTC')}→{(bar_open+pd.Timedelta(hours=4)).tz_convert('UTC')} (вход пропущен)"
+                        )
                     except Exception:
                         log.exception(f"[REST_CATCHUP] {sym} error")
+            # отправим только первые 70 строк, чтобы не спамить
+            if lines:
+                try:
+                    await tg("\n".join(lines[:70]))
+                except Exception:
+                    pass
+            return found, lines
 
-        await _run(syms_linear, "linear")
-        await _run(syms_spot,   "spot")
-        log.info("[REST_CATCHUP] done")
+        total_found = 0
+        f1, _ = await _run(syms_linear, "linear")
+        total_found += f1
+        f2, _ = await _run(syms_spot,   "spot")
+        total_found += f2
+
+        log.info(f"[REST_CATCHUP] done (signals_found={total_found})")
     except Exception:
         log.exception("[REST_CATCHUP] failed")
 
