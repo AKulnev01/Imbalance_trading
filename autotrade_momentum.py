@@ -579,24 +579,24 @@ async def rest_close_scanner_loop():
                                     continue
 
                                 bar_open, bar_close, detect_px, side, strength = args
+
+                                total_signals.append((sym, side, detect_px, strength))
                                 if window_open is None:
                                     window_open, window_close = bar_open.tz_convert("UTC"), (bar_open + pd.Timedelta(hours=4)).tz_convert("UTC")
 
                                 skip_reasons = []
-
                                 try:
                                     if not _positions_limit_ok(category):
                                         skip_reasons.append(f"лимит позиций {MAX_CONCURRENT}")
                                 except Exception:
                                     pass
-
                                 try:
-                                    pp = (get_positions(category=category).get("result", {}) or {}).get("list", []) or []
+                                    pp = (get_positions(category=category).get("result", {}) or {}).get("list",
+                                                                                                        []) or []
                                     if any(p.get("symbol") == sym and abs(float(p.get("size") or 0.0)) > 0 for p in pp):
                                         skip_reasons.append("уже есть открытая позиция")
                                 except Exception:
                                     pass
-
                                 try:
                                     usd_wish = float(POSITION_FRACTION) * float(_alloc_total_usd())
                                     free_cash = _estimate_free_cash_usd(category)
@@ -605,10 +605,20 @@ async def rest_close_scanner_loop():
                                 except Exception:
                                     pass
 
-                                total_signals.append((sym, side, detect_px, strength))
                                 line = f"💡 {sym} | {side} | цена={detect_px:.6f} | сила={strength:.2f}"
                                 if skip_reasons:
                                     line += "\n    пропущен из-за: " + "; ".join(skip_reasons)
+                                    _last_done[sym] = bar_open
+                                    lines.append(line)
+                                    continue
+
+                                ok = await _enter_momentum_market(sym, side, detect_px, bar_open, bar_close,
+                                                                  strength=strength)
+                                if ok:
+                                    _last_done[sym] = bar_open
+                                    line += "\n    ✅ вход выполнен (REST)"
+                                else:
+                                    line += "\n    ❌ вход не выполнен (ошибка)"
                                 lines.append(line)
 
                             except Exception:
@@ -884,7 +894,7 @@ def _pick_and_enter_args(df: pd.DataFrame, symbol: str):
 
     Ключевые отличия:
     • матч по imb['time_open'] ≈ bar_open (а не по imb['time'] ≈ bar_close),
-    • detect_px = open[T] (а не close[T]).
+    • detect_px = close[T] (вход по цене закрытия бара T).
     """
     df = df.copy().sort_index()
     if df.empty or len(df.index) < 3:
@@ -894,7 +904,7 @@ def _pick_and_enter_args(df: pd.DataFrame, symbol: str):
     bar_open = df.index[-1]
     bar_close = bar_open + pd.Timedelta(hours=4)
 
-    # входная цена = OPEN бара, который признан имбалансом
+    # входная цена = CLOSE бара, который признан имбалансом
     try:
         detect_px = float(df.loc[bar_open, "close"])
     except Exception:
@@ -1207,8 +1217,8 @@ async def on_candle_closed(symbol: str, closed_open: Optional[pd.Timestamp] = No
     if df is None or df.empty or df.index[-1] != expected_open:
         log.info(f"[BAR_CLOSE] {symbol}: REST/WS ещё не докинул бар {expected_open} — пропуск")
         return
+
     if REST_AFTER_CLOSE_DELAY_SEC > 0: await asyncio.sleep(REST_AFTER_CLOSE_DELAY_SEC)
-    expected_open = _last_closed_bar_open_utc()
     df = _slice_to_closed_bar(df, expected_open) or df[df.index <= expected_open]
     args = _pick_and_enter_args(df, symbol)
 
