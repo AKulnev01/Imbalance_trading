@@ -521,10 +521,11 @@ async def rest_close_scanner_loop():
     async def _sleep_until(ts: pd.Timestamp):
         # ждём ровно до ts c учётом тек. времени
         while True:
-            now = pd.Timestamp.utcnow().tz_localize("UTC")
+            now = pd.Timestamp.utcnow().tz_convert("UTC")
             left = (ts - now).total_seconds()
-            if left <= 0: break
-            await asyncio.sleep(min(left, 1.0))  # шаг 1 сек для точности и устойчивости к sleep drift
+            if left <= 0:
+                break
+            await asyncio.sleep(min(left, 1.0))
 
     while True:
         try:
