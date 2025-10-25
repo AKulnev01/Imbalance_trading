@@ -1,0 +1,4 @@
+exit_reason,trades,wins,pnl_pct,pnl_usd,avg_exit_days,med_exit_days,winrate_pct
+tp,56,56,720.7800000000001,385.7299327043638,,,100.0
+timeout_max_hours,14,0,43.60241136180283,16.186713681216126,,,0.0
+sl,128,0,-588.1280000000005,-312.107126837832,,,0.0

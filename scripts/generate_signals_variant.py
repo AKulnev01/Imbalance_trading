@@ -2,14 +2,15 @@ import os
 import sys
 import pandas as pd
 from datetime import datetime, timezone
+from pathlib import Path
 
 # гарантируем, что корень проекта в sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from utils.fetch_data import get_bybit_klines
-from utils.strategy import scan_universe
+from utils.strategy import scan_universe, filter_universe_to_local  # ← локальные минутки
 from utils.symbols import fetch_top_symbols
 from config import TRADE_UNIVERSE
+
 
 def _drop_tz_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -24,6 +25,7 @@ def _drop_tz_cols(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.select_dtypes(include=['datetimetz']).columns:
         df[col] = df[col].dt.tz_localize(None)
     return df
+
 
 def main():
     """
@@ -44,6 +46,9 @@ def main():
     mode     = sys.argv[4].lower() if len(sys.argv) > 4 else "all"
 
     universe = list(dict.fromkeys(TRADE_UNIVERSE)) or fetch_top_symbols()[:100]
+    # оставляем только те символы, у которых есть локальные минутки (./data/ohlcv/1m/*.parquet)
+    universe = filter_universe_to_local(universe)
+
     print(f"🔄 Generating signals (variant) → {out_path}")
     print(f"   universe={len(universe)}, lookback={lookback}d, TF={interval}, mode={mode}")
 
@@ -54,6 +59,7 @@ def main():
 
     df = _drop_tz_cols(df)
 
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out_path) as wr:
         df.to_excel(wr, index=False, sheet_name="data")
         meta = pd.DataFrame({
@@ -64,6 +70,7 @@ def main():
         meta.to_excel(wr, index=False, sheet_name="meta")
 
     print(f"✅ Saved: {out_path}  (rows={len(df)})")
+
 
 if __name__ == "__main__":
     main()

@@ -56,15 +56,16 @@ from config import (
     TRADE_UNIVERSE,                # фиксированный список монет (как в бою)
     DEFAULT_MIN_STRENGTH,          # мин. сила FVG
     RISK_REWARD_RATIO,             # для вычисления TP
-    ENTRY_MODE,                # <-- добавь
-    MOMENTUM_TP_PCT,          # <-- добавь
+    ENTRY_MODE,
+    MOMENTUM_TP_PCT,
     MOMENTUM_SL_PCT,
 )
 
-from utils.fetch_data import get_bybit_klines
+# УБРАНО: сетевой импорт get_bybit_klines
+# from utils.fetch_data import get_bybit_klines
 from utils.detect_fvg import detect_fvg_imbalances
 from utils.evaluate_imbalances import evaluate_imbalances
-from utils.strategy import scan_universe
+from utils.strategy import scan_universe, get_klines_4h, filter_universe_to_local
 from utils.symbols import fetch_top_symbols
 
 # === Bybit тестовые вызовы ===
@@ -118,10 +119,13 @@ def _ensure_tznaive_inplace(df: pd.DataFrame, cols: List[str]):
 def _get_ohlc_since(symbol: str, interval: str, start_ts: pd.Timestamp, lookback_days_fallback: int = 7) -> pd.DataFrame:
     """
     Возвращает OHLCV с индексом по времени (UTC) НЕ РАНЬШЕ start_ts.
-    Если провайдер режет по lookback_days, даём небольшой запас.
+    С учётом локального режима: берём 4h через get_klines_4h() и фильтруем по времени.
     """
     lb_days = max(1, lookback_days_fallback)
-    df = get_bybit_klines(symbol=symbol, interval=interval, lookback_days=lb_days)
+    try:
+        df = get_klines_4h(symbol=symbol, lookback_days=lb_days, interval=interval or "4h")
+    except Exception:
+        return pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
     df = _sanitize_ohlcv(df)
@@ -148,12 +152,13 @@ def bulk_closed_report(days: int = 90, interval: Optional[str] = None, max_days_
         max_days_to_fill = MAX_FILL_DAYS
 
     symbols = _universe()
+    symbols = filter_universe_to_local(symbols)
     print(f"🔄 CLOSED scan: {len(symbols)} sym, {days}d, TF={interval}, fill ≤ {max_days_to_fill}d")
 
     rows = []
     for sym in symbols:
         try:
-            df = get_bybit_klines(symbol=sym, interval=interval, lookback_days=days)
+            df = get_klines_4h(symbol=sym, lookback_days=days, interval=interval)
             df = _sanitize_ohlcv(df)
             if df is None or df.empty:
                 print(f"   → {sym}: пусто, пропуск.")
@@ -239,12 +244,13 @@ def bulk_open_report(days: int = 30, interval: Optional[str] = None) -> str:
     interval = interval or DEFAULT_BULK_INTERVAL
 
     symbols = _universe()
+    symbols = filter_universe_to_local(symbols)
     print(f"🔄 OPEN scan: {len(symbols)} sym, {days}d, TF={interval}")
 
     rows = []
     for sym in symbols:
         try:
-            df = get_bybit_klines(symbol=sym, interval=interval, lookback_days=days)
+            df = get_klines_4h(symbol=sym, lookback_days=days, interval=interval)
             df = _sanitize_ohlcv(df)
             if df is None or df.empty:
                 print(f"   → {sym}: пустые данные, пропуск.")
@@ -315,19 +321,20 @@ def bulk_open_report(days: int = 30, interval: Optional[str] = None) -> str:
 
 def bulk_all_report(days: int = 360, interval: Optional[str] = None) -> str:
     """
-    Отчёт по ВСЕМ имбалансам за период (filled и не filled) с базовым винрейтом по filled.
+    Отчёт по ВСЕМ имбалансам за период (filled и не filled) с базовым винрейт по filled.
     Возвращает путь к Excel.
     """
     import datetime as _dt
     interval = interval or DEFAULT_BULK_INTERVAL
 
     symbols = _universe()
+    symbols = filter_universe_to_local(symbols)
     print(f"🔄 ALL scan: {len(symbols)} sym, {days}d, TF={interval}")
 
     rows = []
     for sym in symbols:
         try:
-            df = get_bybit_klines(symbol=sym, interval=interval, lookback_days=days)
+            df = get_klines_4h(symbol=sym, lookback_days=days, interval=interval)
             df = _sanitize_ohlcv(df)
             if df is None or df.empty:
                 print(f"   → {sym}: пусто, пропуск.")
@@ -445,6 +452,7 @@ def missed_signals(hours: int, interval: Optional[str] = None) -> str:
     now = datetime.utcnow()
     since_time = now - timedelta(hours=int(hours))
     symbols = _universe()
+    symbols = filter_universe_to_local(symbols)
     lookback_days = max(1, math.ceil(int(hours) / 24))
     interval = interval or DEFAULT_MISSED_INTERVAL
 
@@ -490,6 +498,7 @@ def missed_trades(hours: int, interval: Optional[str] = None) -> str:
     interval = interval or DEFAULT_LIVE_INTERVAL
 
     symbols = _universe()
+    symbols = filter_universe_to_local(symbols)
     lookback_days = max(1, math.ceil(int(hours) / 24) + 2)
 
     print(f"🔎 Missed-trades: {len(symbols)} sym, window={hours}h, since={since_time} UTC, TF={interval}")
@@ -559,6 +568,7 @@ def active_waiting(lookback_days: int = 7, interval: Optional[str] = None) -> st
 
     interval = interval or DEFAULT_LIVE_INTERVAL
     symbols  = _universe()
+    symbols  = filter_universe_to_local(symbols)
 
     print(f"🔍 Active-waiting (real): {len(symbols)} sym, lookback={lookback_days}d, TF={interval}")
     df_sig = scan_universe(universe=symbols, lookback_days=lookback_days, mode="all", interval=interval)

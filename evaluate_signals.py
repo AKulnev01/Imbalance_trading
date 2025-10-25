@@ -7,7 +7,8 @@ from datetime import timedelta, datetime, timezone
 from typing import Tuple
 
 import config as CFG
-from utils.fetch_data import get_bybit_klines
+from utils.strategy import get_klines_4h
+from evaluate_common import fetch_ltf_window as _fetch_ltf_window
 
 # ===== helpers to read config/env without hardcoding =====
 def _get_cfg(name, *, required=True, cast=None, default=None):
@@ -82,9 +83,6 @@ RISK_REWARD_RATIO = getattr(CFG, "RISK_REWARD_RATIO", None)
 
 VARIANT_COL_CANDIDATES = ["variant", "mode", "entry_mode", "strategy"]
 
-MOMENTUM_FILL_WINDOW_MIN= _get_cfg("MOMENTUM_FILL_WINDOW_MIN",required=True, cast=int)
-MAX_CONCURRENT_POSITIONS= _get_cfg("MAX_CONCURRENT_POSITIONS",required=True, cast=int)
-MOMENTUM_MIN_LTF_BARS   = _get_cfg("MOMENTUM_MIN_LTF_BARS",   required=True, cast=int)
 # ===================== Утилиты =====================
 def _ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -146,47 +144,6 @@ def _repair_levels(side, entry, stop_eval, tp_eval):
     rr = TAKE_PCT / max(STOP_PCT, 1e-9)
     s, t = _calc_sl_tp(float(entry), side, STOP_PCT, rr)
     return float(s), float(t), True
-
-def _momentum_entry(symbol: str, side: str, df_baseTF: pd.DataFrame, t0: pd.Timestamp) -> Tuple[pd.Timestamp, float, str]:
-    """
-    Реалистичный маркет-вход:
-      • last_px = close бара t0 (или ближайшего)
-      • берём ПЕРВОЕ закрытие LTF после t0 в окне MOMENTUM_FILL_WINDOW_MIN
-      • проверяем слиппедж относительно last_px
-      • возврат: (entry_at, entry_px, entry_exec) или (NaT, NaN, 'skip_*')
-    """
-    # last_px по базовому ТФ
-    bar = df_baseTF[df_baseTF.index == t0]
-    if bar.empty:
-        try:
-            nearest_idx = df_baseTF.index.get_indexer([t0], method="nearest")[0]
-            bar = df_baseTF.iloc[[nearest_idx]]
-        except Exception:
-            return (pd.NaT, float("nan"), "no_bar")
-    last_px = float(bar.iloc[0]["close"])
-
-    # окно LTF
-    t_start = t0
-    t_end   = t0 + pd.Timedelta(minutes=int(MOMENTUM_FILL_WINDOW_MIN))
-    ltf = _fetch_ltf_window(symbol, t_start, t_end, candidates=INTRABAR_INTERVALS)
-    if ltf.empty or len(ltf) < max(1, MOMENTUM_MIN_LTF_BARS):
-        return (pd.NaT, float("nan"), "no_ltf")
-
-    # первое закрытие после t0
-    first_ts = ltf.index[0]
-    close_px = float(ltf.iloc[0]["close"])
-
-    # защита по слиппеджу
-    if side == "BUY":
-        rel = (close_px - last_px) / max(last_px, 1e-9)
-        if rel > MAX_ACCEPT_SLIPPAGE_PCT:
-            return (pd.NaT, float("nan"), "skip_slippage")
-    else:
-        rel = (last_px - close_px) / max(last_px, 1e-9)
-        if rel > MAX_ACCEPT_SLIPPAGE_PCT:
-            return (pd.NaT, float("nan"), "skip_slippage")
-
-    return (first_ts, close_px, "market_ltf_close")
 
 def _safe_group_exit_reason(df_res: pd.DataFrame) -> pd.DataFrame:
     df = df_res.copy()
@@ -346,24 +303,6 @@ def _parse_ladder(spec: str):
     return [(d, w/s) for d,w in steps if s > 0]
 
 # ===== LTF helpers =====
-def _fetch_ltf_window(symbol: str, t_start: pd.Timestamp, t_end: pd.Timestamp, candidates=None) -> pd.DataFrame:
-    if candidates is None:
-        candidates = INTRABAR_INTERVALS
-    days = max(1, int((t_end - t_start).total_seconds() // 86400) + 2)
-    days = max(days, INTRABAR_LOOKBACK_DAYS_FALLBACK)
-    for iv in [c.strip() for c in candidates if c.strip()]:
-        try:
-            df_ltf = get_bybit_klines(symbol=symbol, interval=iv, lookback_days=days)
-        except Exception:
-            continue
-        df_ltf = _ensure_dt_index(df_ltf)
-        if df_ltf is None or df_ltf.empty:
-            continue
-        win = df_ltf[(df_ltf.index >= t_start) & (df_ltf.index <= t_end)].copy()
-        if not win.empty:
-            return win
-    return pd.DataFrame(index=pd.DatetimeIndex([], tz='UTC'))
-
 def _resolve_tp_sl_order_ltf(symbol: str, side: str, entry_at: pd.Timestamp, bar_close_time: pd.Timestamp,
                              stop_eval: float, tp_eval: float) -> Tuple[bool, pd.Timestamp, float, str]:
     t0 = _to_utc_safe(entry_at)
@@ -721,7 +660,7 @@ def evaluate_signals(
     symbols = df_sig['symbol'].dropna().unique().tolist()
     for symbol in symbols:
         try:
-            df_hist = get_bybit_klines(symbol=symbol, interval=interval, lookback_days=lookback_days)
+            df_hist = get_klines_4h(symbol=symbol, lookback_days=lookback_days, interval=interval)
         except Exception:
             df_hist = pd.DataFrame()
         df_hist = _ensure_dt_index(df_hist)

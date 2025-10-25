@@ -75,7 +75,7 @@ def find_ltf_file(ltf_root: Path, symbol: str) -> Path:
 def main():
     ap = argparse.ArgumentParser(description="Diagnose evaluate/minute data pipeline")
     ap.add_argument("signals", help="Путь к файлу сигналов (xlsx)")
-    ap.add_argument("--ltf-root", default=os.getenv("LTF_ROOT","./data/m1"),
+    ap.add_argument("--ltf-root", default=os.getenv("LTF_ROOT", "../data/m1"),
                     help="Путь к минуткам (parquet). По умолчанию $LTF_ROOT или ./data/m1")
     ap.add_argument("--sample", type=int, default=10, help="Сколько символов проверить (по сигналам)")
     ap.add_argument("--window-min", type=int, default=60, help="Размер окна минуток после imb_time")

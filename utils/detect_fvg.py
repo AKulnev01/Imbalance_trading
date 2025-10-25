@@ -2,17 +2,22 @@
 
 import os
 import pandas as pd
-from config import MAX_FILL_DAYS
 
 FVG_DEBUG = str(os.getenv("FVG_DEBUG", "0")).lower() in ("1","true","yes","y","on")
 
 def detect_fvg_imbalances(
     df,
-    volume_multiplier=1.5,
-    max_days_to_fill=MAX_FILL_DAYS,
-    tolerance_pct=0.1,
-    min_strength_pct=3.0
+    volume_multiplier=None,
+    max_days_to_fill=None,
+    tolerance_pct=None,
+    min_strength_pct=None
 ):
+    # читаем из env, если не передано вручную
+    volume_multiplier = float(volume_multiplier if volume_multiplier is not None else os.getenv("FVG_VOL_MULT", 1.5))
+    max_days_to_fill = int(max_days_to_fill if max_days_to_fill is not None else os.getenv("MAX_FILL_DAYS", 30))
+    tolerance_pct = float(tolerance_pct if tolerance_pct is not None else os.getenv("FVG_TOLERANCE_PCT", 0.1))
+    min_strength_pct = float(
+        min_strength_pct if min_strength_pct is not None else os.getenv("DEFAULT_MIN_STRENGTH", 3.0))
     """
     Ищет FVG-имбалансы с фильтрацией по силе.
     Возвращает список словарей с полями:

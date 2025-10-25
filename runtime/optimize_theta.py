@@ -2,7 +2,6 @@
 import random, joblib, numpy as np, pandas as pd
 from pathlib import Path
 from runtime.evaluate_theta import evaluate_theta
-from models.neuro_optimizer import CONT, BIN
 
 def suggest(pipe_dict, K=20):
     pipe = pipe_dict["pipe"]

@@ -1,119 +1,146 @@
-import os, time, argparse, requests, pandas as pd
+# data_feed/oi_funding_liq.py
+import os, sys, argparse, requests, pandas as pd
+from datetime import datetime, timezone
+from typing import List, Dict
+from dotenv import load_dotenv
 
-API = "https://api.bybit.com"
+def _load_env():
+    load_dotenv()
+    if os.path.exists(".envrc"):
+        with open(".envrc","r",encoding="utf-8") as f:
+            for ln in f:
+                ln=ln.strip()
+                if not ln or ln.startswith("#"): continue
+                if ln.startswith("export "): ln=ln[7:]
+                if "=" in ln:
+                    k,v = ln.split("=",1); os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-def _ensure_dir(p): os.makedirs(p, exist_ok=True)
+def _now_minute_ts_ms() -> int:
+    dt = datetime.utcnow().replace(second=0, microsecond=0, tzinfo=timezone.utc)
+    return int(dt.timestamp()*1000)
 
-def _session(retries=5, backoff=0.5, connect=6, read=10):
-    from urllib3.util.retry import Retry
-    from requests.adapters import HTTPAdapter
-    s = requests.Session()
-    retry = Retry(total=retries, read=retries, connect=retries, backoff_factor=backoff,
-                  status_forcelist=[429,500,502,503,504], allowed_methods=["GET"])
-    ad = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
-    s.mount("https://", ad); s.mount("http://", ad)
-    s.request_timeout=(connect, read)
-    return s
+def _get_symbols(arg_symbols: str) -> List[str]:
+    if arg_symbols:
+        return [s.strip().upper() for s in arg_symbols.split(",") if s.strip()]
+    env = os.getenv("TRADE_UNIVERSE","").strip()
+    if env:
+        return [s.strip().upper() for s in env.split(",") if s.strip()]
+    try:
+        sys.path.insert(0, os.getcwd())
+        from config import TRADE_UNIVERSE
+        return [s.strip().upper() for s in (TRADE_UNIVERSE or [])]
+    except Exception:
+        return []
 
-def _merge_save(path, df_new):
-    if df_new is None or df_new.empty: return
+def _tickers(category: str, symbols: List[str], timeout: float = 10.0) -> Dict[str, Dict]:
+    """
+    /v5/market/tickers — для linear возвращает openInterest, fundingRate (для spot — нет).
+    """
+    url = "https://api.bybit.com/v5/market/tickers"
+    out: Dict[str, Dict] = {}
+    sess = requests.Session()
+    for s in symbols:
+        try:
+            r = sess.get(url, params={"category": category, "symbol": s}, timeout=timeout)
+            r.raise_for_status()
+            js = r.json()
+            if int(js.get("retCode",-1)) != 0:
+                out[s] = {}
+                continue
+            items = (js.get("result") or {}).get("list") or []
+            out[s] = items[0] if items else {}
+        except Exception:
+            out[s] = {}
+    return out
+
+def _liquidations(category: str, symbol: str, limit: int = 200, timeout: float = 10.0) -> List[Dict]:
+    """
+    /v5/market/liquidation — недокументированно стабилен, но у Bybit есть.
+    Если реткода !=0 — просто вернём пусто, не валим процесс.
+    """
+    url = "https://api.bybit.com/v5/market/liquidation"
+    params = {"category": category, "symbol": symbol, "limit": str(int(limit))}
+    try:
+        r = requests.get(url, params=params, timeout=timeout)
+        r.raise_for_status()
+        js = r.json()
+        if int(js.get("retCode",-1)) != 0:
+            return []
+        return (js.get("result") or {}).get("list") or []
+    except Exception:
+        return []
+
+def _append_row_parquet(path: str, row: Dict, key_cols=("ts",)):
+    df_new = pd.DataFrame([row])
     if os.path.exists(path):
-        try: df_old = pd.read_parquet(path)
-        except Exception: df_old = pd.DataFrame(columns=df_new.columns)
-        df = pd.concat([df_old, df_new], ignore_index=True)
-        df = df.drop_duplicates(subset=[c for c in df.columns if c!="value"]).sort_values(df.columns[0]).reset_index(drop=True)
+        df = pd.read_parquet(path)
+        df = pd.concat([df, df_new], ignore_index=True)
+        df = df.drop_duplicates(subset=list(key_cols), keep="last")
     else:
-        df = df_new.reset_index(drop=True)
+        df = df_new
+    os.makedirs(os.path.dirname(path), exist_ok=True
+    )
     df.to_parquet(path, index=False)
 
-def _ticker_snapshot(sess, category, symbol):
-    # содержит openInterest для linear
-    url = f"{API}/v5/market/tickers"
-    r = sess.get(url, params={"category": category, "symbol": symbol}, timeout=sess.request_timeout)
-    r.raise_for_status()
-    js = r.json()
-    if js.get("retCode") != 0: return None
-    lst = (js.get("result", {}) or {}).get("list") or []
-    if not lst: return None
-    it = lst[0]
-    ts = int(it.get("ts") or 0)
-    oi = float(it.get("openInterest") or 0.0)
-    funding = float(it.get("fundingRate") or 0.0) if "fundingRate" in it else None
-    return {"ts": ts, "open_interest": oi, "funding_rate": funding if funding is not None else 0.0}
-
-def _funding_history(sess, category, symbol, limit=200):
-    url = f"{API}/v5/market/funding/history"
-    r = sess.get(url, params={"category": category, "symbol": symbol, "limit": str(limit)}, timeout=sess.request_timeout)
-    r.raise_for_status()
-    js = r.json()
-    if js.get("retCode") != 0: return pd.DataFrame()
-    rows = (js.get("result", {}) or {}).get("list") or []
-    out=[]
-    for it in rows:
-        # поля: fundingRate, fundingRateTimestamp
-        ts = int(it.get("fundingRateTimestamp") or 0)
-        fr = float(it.get("fundingRate") or 0.0)
-        out.append({"ts": ts, "funding_rate_hist": fr})
-    return pd.DataFrame(out).sort_values("ts")
-
-def _liquidations(sess, category, symbol, limit=200):
-    url = f"{API}/v5/market/liquidation"
-    r = sess.get(url, params={"category": category, "symbol": symbol, "limit": str(limit)}, timeout=sess.request_timeout)
-    r.raise_for_status()
-    js = r.json()
-    if js.get("retCode") != 0: return pd.DataFrame()
-    rows = (js.get("result", {}) or {}).get("list") or []
-    out=[]
-    for it in rows:
-        # price, size, side, updatedTime
-        ts = int(it.get("updatedTime") or 0)
-        px = float(it.get("price") or 0.0)
-        sz = float(it.get("size") or 0.0)
-        sd = (it.get("side") or "").lower()
-        out.append({"ts": ts, "liq_price": px, "liq_size": sz, "liq_side": sd})
-    return pd.DataFrame(out).sort_values("ts")
-
-def collect_meta(symbols, category, out_dir, retries=5, backoff=0.5, connect=6, read=10, sleep=0.3):
-    s = _session(retries, backoff, connect, read)
-    for sym in symbols:
-        try:
-            snap = _ticker_snapshot(s, category, sym)
-            if snap:
-                _merge_save(os.path.join(out_dir, f"{sym}_oi_funding_1m.parquet"), pd.DataFrame([snap]))
-                print(f"[TICKER] {sym} +1")
-
-            fr = _funding_history(s, category, sym, limit=200)
-            if not fr.empty:
-                _merge_save(os.path.join(out_dir, f"{sym}_funding_hist.parquet"), fr)
-                print(f"[FUND] {sym} +{len(fr)}")
-
-            liq = _liquidations(s, category, sym, limit=200)
-            if not liq.empty:
-                _merge_save(os.path.join(out_dir, f"{sym}_liquidations.parquet"), liq)
-                print(f"[LIQ] {sym} +{len(liq)}")
-
-            time.sleep(sleep)
-        except Exception as e:
-            print(f"[META_ERR] {sym} {e}")
-
-if __name__ == "__main__":
+def main():
+    _load_env()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--symbols", default="")
-    ap.add_argument("--category", default=None)
+    ap.add_argument("--symbols")
     ap.add_argument("--out", default="./data/meta1m")
-    ap.add_argument("--retries", type=int, default=5)
-    ap.add_argument("--backoff", type=float, default=0.5)
-    ap.add_argument("--connect-timeout", type=float, default=6.0)
-    ap.add_argument("--read-timeout", type=float, default=10.0)
-    ap.add_argument("--sleep", type=float, default=0.3)
+    ap.add_argument("--category", default=(os.getenv("BYBIT_CATEGORY") or "linear").lower(), choices=["linear","spot"])
     args = ap.parse_args()
 
-    try:
-        from config import TRADE_UNIVERSE, filter_universe, BYBIT_CATEGORY
-    except Exception:
-        TRADE_UNIVERSE, BYBIT_CATEGORY, filter_universe = [], "spot", lambda x:x
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] or filter_universe(TRADE_UNIVERSE or [])
-    category = (args.category or BYBIT_CATEGORY or "spot").lower()
+    syms = _get_symbols(args.symbols or "")
+    if not syms:
+        print("WARN: пустой список символов (TRADE_UNIVERSE не задан)."); return
 
-    _ensure_dir(args.out)
-    collect_meta(symbols, category, args.out, args.retries, args.backoff, args.connect_timeout, args.read_timeout, args.sleep)
+    ts_min = _now_minute_ts_ms()
+
+    # --- OI & Funding (только для linear; для spot вернутся пустые поля и это ок) ---
+    tick = _tickers(args.category, syms)
+
+    for s in syms:
+        try:
+            t = tick.get(s, {}) or {}
+            # В tickers поля строковые
+            oi   = t.get("openInterest");    oi   = float(oi) if oi not in (None,"") else None
+            fund = t.get("fundingRate");     fund = float(fund) if fund not in (None,"") else None
+            row = {"ts": ts_min, "open_interest": oi, "funding_rate": fund, "symbol": s}
+            _append_row_parquet(os.path.join(args.out, f"{s}_oi_funding_1m.parquet"), row)
+            print(f"[OI/FUND] {s} oi={oi} fund={fund}", flush=True)
+        except Exception as e:
+            print(f"[OI/FUND_ERR] {s} {e}", flush=True)
+
+    # --- Liquidations (если эндпоинт вернёт пусто — ничего страшного) ---
+    for s in syms:
+        try:
+            liqs = _liquidations(args.category, s, limit=200)
+            # агрегируем одноминутно (здесь минута одна — текущая)
+            liq_buy_sz = 0.0
+            liq_sell_sz = 0.0
+            liq_px_sum = 0.0
+            liq_px_cnt = 0
+            for ev in liqs:
+                side = str(ev.get("side") or ev.get("S") or "").lower()
+                sz   = ev.get("size") or ev.get("qty") or ev.get("execQty")
+                px   = ev.get("price") or ev.get("execPrice")
+                try:
+                    sz = float(sz) if sz is not None else 0.0
+                    px = float(px) if px is not None else None
+                except Exception:
+                    continue
+                if side == "buy":  liq_buy_sz  += sz
+                elif side == "sell": liq_sell_sz += sz
+                if px is not None:
+                    liq_px_sum += px; liq_px_cnt += 1
+
+            liq_avg_px = (liq_px_sum/liq_px_cnt) if liq_px_cnt>0 else None
+            row = {"ts": ts_min, "liq_buy_sz": liq_buy_sz, "liq_sell_sz": liq_sell_sz,
+                   "liq_count": len(liqs), "liq_avg_px": liq_avg_px, "symbol": s}
+            _append_row_parquet(os.path.join(args.out, f"{s}_liquidations.parquet"), row)
+            print(f"[LIQ] {s} cnt={len(liqs)}", flush=True)
+        except Exception as e:
+            print(f"[LIQ_ERR] {s} {e}", flush=True)
+
+if __name__ == "__main__":
+    main()
