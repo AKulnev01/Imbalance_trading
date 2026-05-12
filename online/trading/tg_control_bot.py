@@ -1834,7 +1834,7 @@ def process_update(update: Dict[str, Any]) -> None:
 
 def main() -> None:
     if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN is empty. Put TELEGRAM_TOKEN=... into .env")
+        raise RuntimeError("Telegram bot token is not configured. Put it into local .env")
 
     print("=" * 120, flush=True)
     print("TG_CONTROL_BOT_STARTED", flush=True)
