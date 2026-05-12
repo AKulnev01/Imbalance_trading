@@ -1,4 +1,6 @@
+# ============================================================
 # Python
+# ============================================================
 __pycache__/
 *.py[cod]
 *.pyo
@@ -8,34 +10,369 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Virtual env
+# ============================================================
+# Virtual environments
+# ============================================================
 .venv/
-env/
 venv/
+env/
 
-# Logs
-*.log
-logs/
-
-# Env files
-.env
-*.env
-
-# State / cache
-autotrade_state.json
-*.sqlite
-*.db
-
-# Jupyter
-.ipynb_checkpoints/
-
-# System
+# ============================================================
+# IDE / OS
+# ============================================================
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db
-.idea/
-signals.xlsx
-pending_orders_state.json
+Icon?
 
-# Blocklist (runtime)
+# ============================================================
+# Secrets / env / private configs
+# ============================================================
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+secrets/
+private/
+
+# Разрешаем только безопасный шаблон окружения, если создашь его руками
+!.env.example
+
+# ============================================================
+# Runtime logs / pid / locks / state
+# ============================================================
+logs/
+*.log
+*.pid
+*.lock
+
+gate_autotrade.pid
+tg_control_bot.pid
+pending_orders_state.json
+autotrade_state.json
 blocklist_symbols.txt
+
+online/_state_*.lock
+online/_state_*.json
+online/*_state.json
+online/*_state.lock
+
+# ============================================================
+# Databases / dumps / local storage
+# ============================================================
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.sql
+db_dumps/
+
+# ============================================================
+# Jupyter
+# ============================================================
+.ipynb_checkpoints/
+*.ipynb
+
+# ============================================================
+# Heavy market data / datasets
+# ============================================================
+data/
+*.parquet
+*.feather
+*.h5
+*.hdf5
+
+# ============================================================
+# ML models / binary artifacts
+# ============================================================
+models/
+models_organized/
+*.cbm
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.joblib
+*.onnx
+*.bin
+*.model
+
+# ============================================================
+# CatBoost service/training artifacts
+# ============================================================
+catboost_info/
+**/catboost_info/
+events.out.tfevents*
+learn_error.tsv
+test_error.tsv
+time_left.tsv
+catboost_training.json
+
+# ============================================================
+# Production private artifacts
+# ============================================================
+production/dataset/
+production/models/
+production/features/
+production/feature_importance/
+production/model_quality_master.csv
+production/model_quality_master.parquet
+
+# CSV/Excel отчёты внутри production могут светить пороги, сделки, valid_predictions
+production/**/*.csv
+production/**/*.xlsx
+production/**/*.xls
+production/**/*.json
+
+# Но можно оставить README/MD внутри production, если они без секретов
+!production/**/*.md
+
+# ============================================================
+# Research private/heavy artifacts
+# ============================================================
+research/models/
+research/models_organized/
+research/reports/
+research/**/*.cbm
+research/**/*.parquet
+research/**/*.pt
+research/**/*.pth
+research/**/*.pkl
+research/**/*.pickle
+research/**/*.joblib
+research/**/*.csv
+research/**/*.xlsx
+research/**/*.xls
+research/**/*.json
+
+# Но README и inventory markdown можно оставить
+!research/**/*.md
+
+# ============================================================
+# Reports / old outputs
+# ============================================================
+reports/
+signals.xlsx
+*.xlsx
+*.xls
+
+# ============================================================
+# Local generated audits / inventories
+# ============================================================
+*_audit.json
+*_AUDIT.json
+*_REPORT.json
+*_report.json
+*_inventory.json
+research_inventory.json
+research_migration_audit.json
+
+# ============================================================
+# Temporary / backups
+# ============================================================
+*.tmp
+*.bak
+*.backup
+*.old
+*.part
+
+# Sensitive / generated trading artifacts
+*.cbm
+*.parquet
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.joblib
+*.onnx
+*.xlsx
+*.xls
+*.sqlite
+*.db
+*.sql
+*.dump
+
+# Local market data / generated datasets
+data/
+db_dumps/
+logs/
+catboost_info/
+
+# Heavy generated reports and artifacts
+reports/
+models/
+models_organized/
+
+# Production private artifacts
+production/dataset/
+production/models/
+production/feature_importance/
+
+# Research heavy artifacts
+research/models/
+research/models_organized/
+research/reports/
+
+# =====================================================================
+# Secrets / local configs / runtime configs
+# =====================================================================
+.env
+.env.*
+*.env
+*.local
+*.local.*
+*.secret
+*.secrets
+*secret*
+*secrets*
+*credential*
+*credentials*
+*token*
+*tokens*
+*api_key*
+*apikey*
+*private_key*
+*.pem
+*.key
+*.crt
+
+# Local project configs
+config.local.py
+config_private.py
+config_secret.py
+secrets.py
+settings.local.py
+settings_private.py
+
+# Trading runtime state
+*_state*.json
+*_state*.lock
+*.pid
+gate_autotrade.pid
+tg_control_bot.pid
+pending_orders_state.json
+blocklist_symbols.txt
+
+# Databases / dumps
+*.sqlite
+*.sqlite3
+*.db
+*.sql
+*.dump
+db_dumps/
+
+# Models / datasets / heavy artifacts
+*.cbm
+*.parquet
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.joblib
+*.onnx
+*.xlsx
+*.xls
+
+# Heavy/private directories
+data/
+logs/
+catboost_info/
+models/
+models_organized/
+production/dataset/
+production/models/
+production/feature_importance/
+research/models/
+research/models_organized/
+research/reports/
+reports/backtest/
+reports/features/
+
+# ============================================================
+# Local shell/env/cache
+# ============================================================
+.envrc
+.cache/
+
+# ============================================================
+# Extra public-repo safety rules
+# ============================================================
+.envrc
+.cache/
+.sync/
+
+# Local configs / thresholds / private runtime parameters
+configs/
+*.yaml
+*.yml
+config.py
+config.local.py
+config_private.py
+config_secret.py
+settings.local.py
+settings_private.py
+
+# Telegram / trading runtime private state
+online/_state_*.json
+online/_state_*.lock
+online/trading/*.log
+online/trading/*state*.json
+online/trading/*state*.lock
+
+# ============================================================
+# Public repo: generated reports / research exports / backtest outputs
+# ============================================================
+NIRS/
+online/result/
+online/_reports_gate*/
+online/**/_reports*/
+online/**/*.csv
+online/**/*.xlsx
+online/**/*.xls
+online/**/*.json
+
+# Разрешаем код внутри online
+!online/**/*.py
+!online/**/__init__.py
+!online/**/*.md
+
+# ============================================================
+# Pipeline generated test outputs / private validation artifacts
+# ============================================================
+pipeline/test/
+production/pipeline/test/
+
+# Backup files
+*.bak
+*.bak_*
+*.backup
+*.old
+
+# Разрешаем только Python-код, если он лежит внутри test-папок
+!pipeline/test/**/*.py
+!pipeline/test/**/__init__.py
+!pipeline/test/**/*.md
+!production/pipeline/test/**/*.py
+!production/pipeline/test/**/__init__.py
+!production/pipeline/test/**/*.md
+
+
+# =====================================================================
+# Never publish local runtime config files, even inside online/
+# =====================================================================
+config.py
+**/config.py
+!config.example.py
+!**/config.example.py
+.envrc
+.cache/
+.sync/

@@ -1,2 +1,0 @@
-file,signals,min_strength,volume_multiplier,tolerance_pct,max_fill_days,interval,lookback_days,tag,generated_at_utc
-data/signals/signals_ms3.0_vm1.5_tol0.1_max30_4h_360d_rebuild_after_new_coins_465dac.xlsx,1629,3.0,1.5,0.1,30,4h,360,rebuild_after_new_coins,20251020_1100
