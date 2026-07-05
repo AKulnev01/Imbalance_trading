@@ -2,6 +2,8 @@ from online.trading import config
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from online.oos_context import append_oos_sql_filters, get_online_oos_context
 import argparse
 import json
 import warnings
@@ -322,6 +324,7 @@ def load_feature_rows_for_symbol(symbol: str, rebuild: bool, limit_latest: Optio
     return df
 
 
+
 def load_feature_rows_batch(symbols: List[str], rebuild: bool, limit_latest: Optional[int]) -> pd.DataFrame:
     symbols_clean = sorted(set(str(x).upper().strip() for x in symbols if str(x).strip()))
     if not symbols_clean:
@@ -341,12 +344,25 @@ def load_feature_rows_batch(symbols: List[str], rebuild: bool, limit_latest: Opt
             )
         """.format(pred_table=ONLINE_GATE2_PREDICTIONS_TABLE)
 
+    where_parts = ["UPPER(f.symbol) = ANY(%s)"]
+    params: List[object] = [symbols_clean]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="f",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
+
     if limit_latest is not None and int(limit_latest) > 0:
         query = """
             WITH src AS (
                 SELECT f.*
                 FROM {features_table} f
-                WHERE UPPER(f.symbol) = ANY(%s)
+                WHERE {where_sql}
                 {missing_sql}
             ),
             ranked AS (
@@ -364,21 +380,22 @@ def load_feature_rows_batch(symbols: List[str], rebuild: bool, limit_latest: Opt
             ORDER BY symbol ASC, entry_ts ASC
         """.format(
             features_table=ONLINE_GATE2_FEATURES_TABLE,
+            where_sql=where_sql,
             missing_sql=missing_sql,
         )
-        params = (symbols_clean, int(limit_latest))
+        params.append(int(limit_latest))
     else:
         query = """
             SELECT f.*
             FROM {features_table} f
-            WHERE UPPER(f.symbol) = ANY(%s)
+            WHERE {where_sql}
             {missing_sql}
             ORDER BY f.symbol ASC, f.entry_ts ASC
         """.format(
             features_table=ONLINE_GATE2_FEATURES_TABLE,
+            where_sql=where_sql,
             missing_sql=missing_sql,
         )
-        params = (symbols_clean,)
 
     with connect_db() as conn:
         df = pd.read_sql_query(query, conn, params=params)
@@ -394,9 +411,6 @@ def load_feature_rows_batch(symbols: List[str], rebuild: bool, limit_latest: Opt
     df = df.dropna(subset=["symbol", "entry_ts"]).sort_values(["symbol", "entry_ts"]).reset_index(drop=True)
 
     return df
-
-
-
 def validate_model_features(df: pd.DataFrame, models: Dict[str, Dict[str, object]]) -> pd.DataFrame:
     rows = []
 
@@ -613,15 +627,25 @@ def main() -> None:
     print()
 
     ensure_predictions_table()
+    oos_ctx = get_online_oos_context()
 
     if rebuild and not dry_run:
-        clear_predictions_table()
+        if oos_ctx.enabled:
+            print("REBUILD_WITH_OOS: full predictions table truncate disabled; OOS rows will be overwritten by upsert")
+        else:
+            clear_predictions_table()
 
     if symbol_arg:
         symbols = [symbol_arg]
+    elif oos_ctx.enabled:
+        symbols = list(oos_ctx.symbols)
     else:
         symbols = get_symbols_from_features()
 
+    print("OOS_MODE:", oos_ctx.enabled)
+    print("OOS_SYMBOLS:", ",".join(oos_ctx.symbols))
+    print("OOS_START:", oos_ctx.start_text)
+    print("OOS_END:", oos_ctx.end_text)
     print("SYMBOLS:", len(symbols))
     print("DB_BATCH_LOAD: gate2 feature rows for all symbols")
     print()

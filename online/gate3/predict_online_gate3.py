@@ -5,10 +5,13 @@ from pathlib import Path
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+from online.oos_context import append_oos_sql_filters, get_online_oos_context
 import argparse
 import json
 import traceback
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -48,6 +51,8 @@ SOURCE_NAME = "online_gate3_score_predictions_v1"
 PREDICTION_BUILDER = "online/gate3/predict_online_gate3.py"
 
 DEFAULT_THRESHOLD = 0.50
+DEFAULT_FEATURE_CONTEXT_BARS = 260
+DEFAULT_MAX_WORKERS = int(os.environ.get("IMB_GATE3_PREDICT_WORKERS", "8"))
 
 EXCLUDED_SYMBOLS = {
     "AGTUSDT",
@@ -159,15 +164,28 @@ def get_symbols_from_features() -> List[str]:
     return sorted(set(symbols))
 
 
+
 def get_missing_feature_rows(symbol: str, rebuild: bool, limit_latest: Optional[int]) -> pd.DataFrame:
+    where_parts = ["f.symbol = %s"]
+    params: List[object] = [symbol]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="f",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
+
     if rebuild or not table_exists(ONLINE_GATE3_PREDICTIONS_TABLE):
         query = f"""
             SELECT f.symbol, f.entry_ts
             FROM {ONLINE_GATE3_FEATURES_TABLE} f
-            WHERE f.symbol = %s
+            WHERE {where_sql}
             ORDER BY f.entry_ts ASC
         """
-        params = [symbol]
     else:
         query = f"""
             SELECT f.symbol, f.entry_ts
@@ -175,11 +193,10 @@ def get_missing_feature_rows(symbol: str, rebuild: bool, limit_latest: Optional[
             LEFT JOIN {ONLINE_GATE3_PREDICTIONS_TABLE} p
               ON p.symbol = f.symbol
              AND p.entry_ts = f.entry_ts
-            WHERE f.symbol = %s
+            WHERE {where_sql}
               AND p.entry_ts IS NULL
             ORDER BY f.entry_ts ASC
         """
-        params = [symbol]
 
     with connect_db() as conn:
         df = pd.read_sql_query(query, conn, params=params)
@@ -195,9 +212,6 @@ def get_missing_feature_rows(symbol: str, rebuild: bool, limit_latest: Optional[
         df = df.tail(int(limit_latest)).reset_index(drop=True)
 
     return df
-
-
-
 def empty_missing_feature_rows() -> pd.DataFrame:
     return pd.DataFrame(columns=["symbol", "entry_ts"])
 
@@ -223,6 +237,7 @@ def normalize_missing_feature_rows(df: pd.DataFrame, limit_latest: Optional[int]
     return out.reset_index(drop=True)
 
 
+
 def load_missing_feature_rows_batch(
     symbols: List[str],
     rebuild: bool,
@@ -236,11 +251,24 @@ def load_missing_feature_rows_batch(
     if not symbols_clean:
         return {}
 
+    where_parts = ["f.symbol = ANY(%s)"]
+    params: List[object] = [symbols_clean]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="f",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
+
     if rebuild or not table_exists(ONLINE_GATE3_PREDICTIONS_TABLE):
         query = f"""
             SELECT f.symbol, f.entry_ts
             FROM {ONLINE_GATE3_FEATURES_TABLE} f
-            WHERE f.symbol = ANY(%s)
+            WHERE {where_sql}
             ORDER BY f.symbol ASC, f.entry_ts ASC
         """
     else:
@@ -250,13 +278,13 @@ def load_missing_feature_rows_batch(
             LEFT JOIN {ONLINE_GATE3_PREDICTIONS_TABLE} p
               ON p.symbol = f.symbol
              AND p.entry_ts = f.entry_ts
-            WHERE f.symbol = ANY(%s)
+            WHERE {where_sql}
               AND p.entry_ts IS NULL
             ORDER BY f.symbol ASC, f.entry_ts ASC
         """
 
     with connect_db() as conn:
-        df = pd.read_sql_query(query, conn, params=[symbols_clean])
+        df = pd.read_sql_query(query, conn, params=params)
 
     df = normalize_missing_feature_rows(df, limit_latest=limit_latest)
 
@@ -266,8 +294,6 @@ def load_missing_feature_rows_batch(
         result[symbol] = part.reset_index(drop=True) if not part.empty else empty_missing_feature_rows()
 
     return result
-
-
 def load_feature_context_batch(missing_by_symbol: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     bounds = []
 
@@ -275,11 +301,18 @@ def load_feature_context_batch(missing_by_symbol: Dict[str, pd.DataFrame]) -> Di
         if missing is None or missing.empty:
             continue
 
-        max_ts = pd.to_datetime(missing["entry_ts"], utc=True, errors="coerce").max()
-        if pd.isna(max_ts):
+        ts = pd.to_datetime(missing["entry_ts"], utc=True, errors="coerce").dropna()
+        if ts.empty:
             continue
 
-        bounds.append((str(symbol).upper(), to_db_utc_datetime(max_ts)))
+        min_ts = pd.Timestamp(ts.min()) - pd.Timedelta(hours=4 * int(DEFAULT_FEATURE_CONTEXT_BARS))
+        max_ts = pd.Timestamp(ts.max())
+
+        bounds.append((
+            str(symbol).upper(),
+            to_db_utc_datetime(min_ts),
+            to_db_utc_datetime(max_ts),
+        ))
 
     if not bounds:
         return {}
@@ -287,8 +320,9 @@ def load_feature_context_batch(missing_by_symbol: Dict[str, pd.DataFrame]) -> Di
     query = f"""
         SELECT f.*
         FROM {ONLINE_GATE3_FEATURES_TABLE} f
-        INNER JOIN (VALUES %s) AS b(symbol, max_ts)
+        INNER JOIN (VALUES %s) AS b(symbol, min_ts, max_ts)
             ON f.symbol = b.symbol
+           AND f.entry_ts >= b.min_ts::timestamptz
            AND f.entry_ts <= b.max_ts::timestamptz
         ORDER BY f.symbol ASC, f.entry_ts ASC
     """
@@ -323,23 +357,40 @@ def load_feature_context_batch(missing_by_symbol: Dict[str, pd.DataFrame]) -> Di
 
 
 def load_feature_context(symbol: str, max_ts: pd.Timestamp) -> pd.DataFrame:
+    max_ts = pd.Timestamp(max_ts)
+    min_ts = max_ts - pd.Timedelta(hours=4 * int(DEFAULT_FEATURE_CONTEXT_BARS))
+
     query = f"""
         SELECT *
         FROM {ONLINE_GATE3_FEATURES_TABLE}
         WHERE symbol = %s
+          AND entry_ts >= %s
           AND entry_ts <= %s
         ORDER BY entry_ts ASC
     """
 
     with connect_db() as conn:
-        df = pd.read_sql_query(query, conn, params=[symbol, to_db_utc_datetime(max_ts)])
+        df = pd.read_sql_query(
+            query,
+            conn,
+            params=[
+                symbol,
+                to_db_utc_datetime(min_ts),
+                to_db_utc_datetime(max_ts),
+            ],
+        )
 
     if df.empty:
         return df
 
     df["symbol"] = df["symbol"].astype(str).str.upper()
     df["entry_ts"] = pd.to_datetime(df["entry_ts"], utc=True, errors="coerce").dt.tz_convert(None)
-    df = df.dropna(subset=["entry_ts"]).sort_values("entry_ts").drop_duplicates(["symbol", "entry_ts"], keep="last").reset_index(drop=True)
+    df = (
+        df.dropna(subset=["entry_ts"])
+        .sort_values("entry_ts")
+        .drop_duplicates(["symbol", "entry_ts"], keep="last")
+        .reset_index(drop=True)
+    )
     return df
 
 
@@ -1179,6 +1230,9 @@ def parse_args() -> Tuple[Optional[str], bool, Optional[int]]:
 def main() -> None:
     symbol_arg, rebuild, limit_latest = parse_args()
 
+    verbose_symbol_logs = str(os.environ.get("IMB_VERBOSE_SYMBOL_LOGS", "0")).strip().lower() in {"1", "true", "yes", "y"}
+    max_workers = max(1, int(DEFAULT_MAX_WORKERS))
+
     print("ROOT:", ROOT)
     print("DB_DSN:", DB_DSN)
     print("ONLINE_GATE3_FEATURES_TABLE:", ONLINE_GATE3_FEATURES_TABLE)
@@ -1187,6 +1241,7 @@ def main() -> None:
     print("POLICY_CSV:", POLICY_CSV)
     print("REBUILD:", rebuild)
     print("LIMIT_LATEST:", limit_latest)
+    print("MAX_WORKERS:", max_workers)
     print()
 
     if not table_exists(ONLINE_GATE3_FEATURES_TABLE):
@@ -1196,12 +1251,19 @@ def main() -> None:
     create_predictions_table()
 
     policy = load_policy()
+    oos_ctx = get_online_oos_context()
 
     if symbol_arg:
         symbols = [symbol_arg]
+    elif oos_ctx.enabled:
+        symbols = list(oos_ctx.symbols)
     else:
         symbols = get_symbols_from_features()
 
+    print("OOS_MODE:", oos_ctx.enabled)
+    print("OOS_SYMBOLS:", ",".join(oos_ctx.symbols))
+    print("OOS_START:", oos_ctx.start_text)
+    print("OOS_END:", oos_ctx.end_text)
     print("SYMBOLS:", len(symbols))
     print("DB_BATCH_LOAD: missing gate3 prediction targets + online_gate3_features context")
     print()
@@ -1211,7 +1273,16 @@ def main() -> None:
         rebuild=rebuild,
         limit_latest=limit_latest,
     )
-    context_by_symbol = load_feature_context_batch(missing_by_symbol)
+
+    symbols_to_process = [
+        s for s in symbols
+        if s in missing_by_symbol and missing_by_symbol[s] is not None and not missing_by_symbol[s].empty
+    ]
+
+    context_by_symbol = load_feature_context_batch({
+        s: missing_by_symbol[s]
+        for s in symbols_to_process
+    })
 
     missing_total = int(sum(len(x) for x in missing_by_symbol.values()))
     missing_symbols = int(sum(1 for x in missing_by_symbol.values() if x is not None and not x.empty))
@@ -1219,74 +1290,111 @@ def main() -> None:
 
     print("MISSING_GATE3_PREDICTION_ROWS_TOTAL:", missing_total)
     print("MISSING_GATE3_PREDICTION_SYMBOLS:", missing_symbols)
+    print("SYMBOLS_TO_PROCESS:", len(symbols_to_process))
     print("GATE3_FEATURE_CONTEXT_ROWS_BATCH:", context_total)
     print()
 
     reports = []
-    total_predicted = 0
-    total_inserted = 0
-    total_long_pass = 0
-    total_short_pass = 0
+    pred_frames = []
 
-    for idx, symbol in enumerate(symbols, start=1):
-        print(f"[{idx}/{len(symbols)}] {symbol}")
+    if symbols_to_process:
+        workers = min(max_workers, len(symbols_to_process))
 
-        try:
-            missing = missing_by_symbol.get(symbol, empty_missing_feature_rows())
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_symbol = {}
 
-            policy_row = policy_row_for_symbol(policy, symbol)
+            for symbol in symbols_to_process:
+                missing = missing_by_symbol.get(symbol, empty_missing_feature_rows())
+                policy_row = policy_row_for_symbol(policy, symbol)
 
-            pred_df, rep = build_predictions_for_symbol(
-                symbol=symbol,
-                missing_df=missing,
-                policy_row=policy_row,
-                feature_context_df=context_by_symbol.get(symbol),
-            )
+                fut = pool.submit(
+                    build_predictions_for_symbol,
+                    symbol,
+                    missing,
+                    policy_row,
+                    context_by_symbol.get(symbol),
+                )
+                future_to_symbol[fut] = symbol
 
-            inserted = upsert_predictions(pred_df) if not pred_df.empty else 0
-            rep["inserted"] = int(inserted)
+            for fut in as_completed(future_to_symbol):
+                symbol = future_to_symbol[fut]
 
-            if not pred_df.empty:
-                total_long_pass += int(pred_df["gate3_pass_long"].astype(bool).sum())
-                total_short_pass += int(pred_df["gate3_pass_short"].astype(bool).sum())
+                try:
+                    pred_df, rep = fut.result()
+                    pred_frames.append(pred_df)
+                    reports.append(rep)
 
-            total_predicted += int(rep.get("rows_predicted", 0))
-            total_inserted += int(inserted)
+                    if verbose_symbol_logs:
+                        print(
+                            "{} | status={} | to_predict={} | context={} | predicted={} | long_bundle={} | short_bundle={}".format(
+                                symbol,
+                                rep.get("status"),
+                                rep.get("feature_rows_to_predict", 0),
+                                rep.get("context_rows", 0),
+                                rep.get("rows_predicted", 0),
+                                rep.get("has_gate3_long_bundle", 0),
+                                rep.get("has_gate3_short_bundle", 0),
+                            )
+                        )
 
-            reports.append(rep)
+                except Exception as e:
+                    rep = {
+                        "symbol": symbol,
+                        "status": "error",
+                        "feature_rows_to_predict": 0,
+                        "context_rows": 0,
+                        "rows_predicted": 0,
+                        "inserted": 0,
+                        "has_gate3_long_bundle": 0,
+                        "has_gate3_short_bundle": 0,
+                        "long_feature_count": 0,
+                        "short_feature_count": 0,
+                        "err": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc(),
+                    }
+                    reports.append(rep)
+                    print("{} | ERROR: {}".format(symbol, rep["err"]))
 
-            print(
-                f"    status={rep['status']} | "
-                f"to_predict={rep.get('feature_rows_to_predict', 0)} | "
-                f"context={rep.get('context_rows', 0)} | "
-                f"predicted={rep.get('rows_predicted', 0)} | "
-                f"inserted={inserted} | "
-                f"long_bundle={rep.get('has_gate3_long_bundle', 0)} | "
-                f"short_bundle={rep.get('has_gate3_short_bundle', 0)}"
-            )
+    no_missing_symbols = [s for s in symbols if s not in symbols_to_process]
+    for symbol in no_missing_symbols:
+        reports.append({
+            "symbol": symbol,
+            "status": "no_missing",
+            "feature_rows_to_predict": 0,
+            "context_rows": 0,
+            "rows_predicted": 0,
+            "inserted": 0,
+            "has_gate3_long_bundle": 0,
+            "has_gate3_short_bundle": 0,
+            "long_feature_count": 0,
+            "short_feature_count": 0,
+            "err": "",
+        })
 
-            if rep.get("err"):
-                print(f"    err={rep['err']}")
+    if pred_frames:
+        all_pred = pd.concat([x for x in pred_frames if x is not None and not x.empty], ignore_index=True)
+    else:
+        all_pred = pd.DataFrame()
 
-        except Exception as e:
-            rep = {
-                "symbol": symbol,
-                "status": "error",
-                "feature_rows_to_predict": 0,
-                "context_rows": 0,
-                "rows_predicted": 0,
-                "inserted": 0,
-                "has_gate3_long_bundle": 0,
-                "has_gate3_short_bundle": 0,
-                "long_feature_count": 0,
-                "short_feature_count": 0,
-                "err": f"{type(e).__name__}: {e}",
-                "traceback": traceback.format_exc(),
-            }
-            reports.append(rep)
-            print(f"    ERROR: {rep['err']}")
+    if all_pred.empty:
+        total_inserted = 0
+        total_predicted = 0
+        total_long_pass = 0
+        total_short_pass = 0
+    else:
+        total_inserted = upsert_predictions(all_pred)
+        total_predicted = int(len(all_pred))
+        total_long_pass = int(all_pred["gate3_pass_long"].astype(bool).sum())
+        total_short_pass = int(all_pred["gate3_pass_short"].astype(bool).sum())
+
+    for rep in reports:
+        if rep.get("rows_predicted", 0) > 0:
+            rep["inserted"] = int(rep.get("rows_predicted", 0))
 
     rep_df = pd.DataFrame(reports)
+    if len(rep_df):
+        rep_df = rep_df.sort_values("symbol").reset_index(drop=True)
+
     rep_df.to_csv(REPORT_CSV, index=False)
 
     status_counts = rep_df["status"].value_counts(dropna=False).sort_index().to_dict() if len(rep_df) else {}
@@ -1300,8 +1408,10 @@ def main() -> None:
         "gate3_score_root": str(GATE3_SCORE_ROOT),
         "policy_csv": str(POLICY_CSV),
         "symbols_count": int(len(symbols)),
+        "symbols_to_process": int(len(symbols_to_process)),
         "rebuild": bool(rebuild),
         "limit_latest": limit_latest,
+        "max_workers": int(max_workers),
         "status_counts": status_counts,
         "total_rows_predicted": int(total_predicted),
         "total_inserted": int(total_inserted),
@@ -1319,6 +1429,7 @@ def main() -> None:
     print("=" * 120)
     print("DONE")
     print("STATUS COUNTS:", status_counts)
+    print("SYMBOLS TO PROCESS:", len(symbols_to_process))
     print("TOTAL ROWS PREDICTED:", total_predicted)
     print("TOTAL INSERTED:", total_inserted)
     print("TOTAL GATE3 LONG PASS:", total_long_pass)

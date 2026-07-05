@@ -14,6 +14,7 @@ import pandas as pd
 
 from online.trading import config
 from online.trading.db import read_sql
+from online.trading.excel.backtest_xlsx_export import export_backtest_xlsx
 
 from online.trading.dynamic_blacklist import (
     is_symbol_allowed,
@@ -28,6 +29,17 @@ warnings.filterwarnings("ignore", category=UserWarning)
 ROOT = config.ROOT
 M1_DB_TABLE = "public.candles_m1"
 H4_SECONDS = 4 * 60 * 60
+
+# Backtest execution rule:
+# if H4 candle closes at 16:00, entry is M1 open at 16:01.
+BACKTEST_SECOND_MINUTE_OPEN_DELAY_SECONDS = 60
+
+SIDE_AWARE_WHITELIST: Dict[str, List[str]] = config.SIDE_AWARE_WHITELIST
+CONDITIONAL_SIDE_AWARE_WHITELIST: Dict[str, Dict[str, Dict[str, float]]] = getattr(
+    config,
+    "CONDITIONAL_SIDE_AWARE_WHITELIST",
+    {},
+)
 
 
 def ask_value(prompt: str, default: Optional[str] = None) -> str:
@@ -64,8 +76,18 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--start", default="")
     p.add_argument("--end", default="")
+    p.add_argument(
+        "--symbols",
+        default="",
+        help=(
+            "Comma-separated symbols with optional side filter. "
+            "Examples: BTCUSDT or ADAUSDT L,BTCUSDT S,ETHUSDT. "
+            "Side aliases: L/LONG/BUY and S/SHORT/SELL."
+        ),
+    )
 
     p.add_argument("--gate2", type=float, default=None)
+    p.add_argument("--gate2-side-margin-min", dest="gate2_side_margin_min", type=float, default=0.0)
     p.add_argument("--gate4", type=float, default=None)
     p.add_argument("--gate5-1", dest="gate5_1", type=float, default=None)
     p.add_argument("--gate5-3", dest="gate5_3", type=float, default=None)
@@ -77,11 +99,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sl-atr", type=float, default=float(config.SL_ATR))
     p.add_argument("--ttl-hours", type=int, default=int(config.TTL_HOURS))
 
-    p.add_argument("--entry-delay-seconds", type=int, default=int(getattr(config, "BACKTEST_ENTRY_DELAY_SECONDS", 90)))
+    p.add_argument(
+        "--entry-delay-seconds",
+        type=int,
+        default=BACKTEST_SECOND_MINUTE_OPEN_DELAY_SECONDS,
+    )
 
     p.add_argument("--capital", type=float, default=100.0)
     p.add_argument("--fee-side", type=float, default=float(config.BACKTEST_FEE_SIDE))
     p.add_argument("--slippage-side", type=float, default=float(config.BACKTEST_SLIPPAGE_SIDE))
+    p.add_argument(
+        "--max-full-sl-capital-risk",
+        type=float,
+        default=0.07,
+        help="Max capital loss for full MAIN_SL. Example: 0.07 = 7%%. Use 0 to disable.",
+    )
 
     p.add_argument("--exclude-symbols", default="")
     p.add_argument("--ignore-db-blacklist", action="store_true")
@@ -92,8 +124,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reset-backtest-blacklist", type=int, choices=[0, 1], default=None)
     p.add_argument("--blacklist-source", default="")
     p.add_argument("--chulan", type=int, choices=[0, 1], default=None)
+    p.add_argument("--side-aware-whitelist", type=int, choices=[0, 1], default=None)
+    p.add_argument(
+        "--conditional-side-aware-whitelist",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Use conditional side-aware whitelist with Gate2 side margin. Default: 1.",
+    )
+    p.add_argument("--slots", type=int, default=None)
 
     args = p.parse_args()
+
+    symbol_research_requested = bool(str(args.symbols or "").strip())
+
+    if symbol_research_requested:
+        if args.chulan is None:
+            args.chulan = 0
+        if args.side_aware_whitelist is None:
+            args.side_aware_whitelist = 0
+        args.conditional_side_aware_whitelist = 0
+        if args.slots is None:
+            args.slots = 1
+        if args.write_dynamic_blacklist is None:
+            args.write_dynamic_blacklist = 0
+        if args.reset_backtest_blacklist is None:
+            args.reset_backtest_blacklist = 0
+        args.ignore_db_blacklist = True
 
     if not args.start:
         args.start = ask_value("Введите начало backtest UTC, например 2026-05-01 12:00:00+00:00")
@@ -117,6 +174,33 @@ def parse_args() -> argparse.Namespace:
 
     if int(args.chulan) not in [0, 1]:
         raise RuntimeError("bad chulan value: {}. Use 0 or 1".format(args.chulan))
+
+    if args.side_aware_whitelist is None:
+        args.side_aware_whitelist = ask_int(
+            "Side-aware whitelist включить? 0=нет, 1=да",
+            0,
+        )
+
+    if int(args.side_aware_whitelist) not in [0, 1]:
+        raise RuntimeError(
+            "bad side_aware_whitelist value: {}. Use 0 or 1".format(
+                args.side_aware_whitelist
+            )
+        )
+
+    if args.slots is None:
+        args.slots = ask_int(
+            "Количество слотов",
+            1,
+        )
+
+    if int(args.slots) != 1:
+        raise RuntimeError(
+            "Сейчас в этом backtest реализован только slot1. Получено slots={}".format(
+                args.slots
+            )
+        )
+
     if args.write_dynamic_blacklist is None:
         args.write_dynamic_blacklist = int(
             ask_bool_01("Записывать dynamic blacklist? 0=нет, 1=да", 0)
@@ -129,6 +213,25 @@ def parse_args() -> argparse.Namespace:
 
     args.write_dynamic_blacklist = bool(int(args.write_dynamic_blacklist))
     args.reset_backtest_blacklist = bool(int(args.reset_backtest_blacklist))
+    args.side_aware_whitelist = bool(int(args.side_aware_whitelist))
+    args.conditional_side_aware_whitelist = bool(int(args.conditional_side_aware_whitelist))
+    args.slots = int(args.slots)
+
+    args = apply_symbol_research_mode(args)
+
+    if float(args.max_full_sl_capital_risk) < 0:
+        raise RuntimeError(
+            "bad max_full_sl_capital_risk: {}. Use >= 0.".format(
+                args.max_full_sl_capital_risk
+            )
+        )
+
+    if float(getattr(args, "gate2_side_margin_min", 0.0) or 0.0) < 0:
+        raise RuntimeError(
+            "bad gate2_side_margin_min: {}. Use >= 0.".format(
+                getattr(args, "gate2_side_margin_min", None)
+            )
+        )
 
     if not str(args.blacklist_source or "").strip():
         args.blacklist_source = default_blacklist_source(args)
@@ -156,6 +259,159 @@ def norm_ts(value) -> pd.Timestamp:
 
 def parse_symbol_list(raw: str) -> List[str]:
     return [x.strip().upper() for x in str(raw or "").split(",") if x.strip()]
+
+
+def normalize_symbol_filter_token(raw: str) -> str:
+    symbol = str(raw or "").strip().upper()
+    symbol = symbol.replace("/", "")
+    symbol = symbol.replace("-", "")
+    symbol = symbol.replace("_", "")
+
+    if not symbol:
+        raise RuntimeError("empty symbol in --symbols")
+
+    return symbol
+
+
+def normalize_side_filter_token(raw: str) -> str:
+    side = str(raw or "").strip().upper()
+
+    if side in ["L", "LONG", "BUY"]:
+        return "LONG"
+
+    if side in ["S", "SHORT", "SELL"]:
+        return "SHORT"
+
+    raise RuntimeError(
+        "bad side in --symbols: {}. Use L/S or LONG/SHORT.".format(raw)
+    )
+
+
+def parse_symbol_side_filters(raw: str) -> Dict[str, object]:
+    text = str(raw or "").strip()
+
+    result: Dict[str, object] = {
+        "enabled": False,
+        "symbols": [],
+        "by_symbol": {},
+    }
+
+    if not text:
+        return result
+
+    chunks = [
+        x.strip()
+        for x in text.replace(";", ",").split(",")
+        if x.strip()
+    ]
+
+    symbols: List[str] = []
+    by_symbol: Dict[str, Optional[List[str]]] = {}
+
+    for chunk in chunks:
+        normalized_chunk = (
+            chunk
+            .replace(":", " ")
+            .replace("|", " ")
+            .replace("=", " ")
+        )
+
+        parts = [x.strip() for x in normalized_chunk.split() if x.strip()]
+
+        if not parts:
+            continue
+
+        if len(parts) > 2:
+            raise RuntimeError(
+                "bad --symbols item: {}. Use SYMBOL or SYMBOL SIDE.".format(chunk)
+            )
+
+        symbol = normalize_symbol_filter_token(parts[0])
+        side: Optional[str] = None
+
+        if len(parts) == 2:
+            side = normalize_side_filter_token(parts[1])
+
+        if symbol not in symbols:
+            symbols.append(symbol)
+
+        if symbol not in by_symbol:
+            by_symbol[symbol] = None if side is None else [side]
+            continue
+
+        current = by_symbol[symbol]
+
+        if current is None:
+            continue
+
+        if side is None:
+            by_symbol[symbol] = None
+            continue
+
+        if side not in current:
+            current.append(side)
+
+    result["enabled"] = bool(symbols)
+    result["symbols"] = symbols
+    result["by_symbol"] = by_symbol
+
+    return result
+
+
+def format_symbol_side_filters(raw: str) -> str:
+    filters = parse_symbol_side_filters(raw)
+
+    if not bool(filters["enabled"]):
+        return ""
+
+    by_symbol = filters["by_symbol"]
+    symbols = filters["symbols"]
+
+    items = []
+
+    for symbol in symbols:
+        sides = by_symbol.get(symbol)
+
+        if sides is None:
+            items.append(symbol)
+            continue
+
+        items.append("{} {}".format(symbol, "/".join(sides)))
+
+    return ",".join(items)
+
+
+def apply_symbol_side_filters(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    filters = parse_symbol_side_filters(str(getattr(args, "symbols", "") or ""))
+
+    if not bool(filters["enabled"]):
+        return df
+
+    if df.empty:
+        return df
+
+    by_symbol = filters["by_symbol"]
+
+    keep_mask = []
+
+    for _, row in df.iterrows():
+        symbol = str(row.get("symbol") or "").strip().upper()
+        side = normalize_side_for_whitelist(str(row.get("side") or ""))
+
+        if symbol not in by_symbol:
+            keep_mask.append(False)
+            continue
+
+        allowed_sides = by_symbol[symbol]
+
+        if allowed_sides is None:
+            keep_mask.append(True)
+            continue
+
+        keep_mask.append(side in allowed_sides)
+
+    out = df[pd.Series(keep_mask, index=df.index)].copy()
+    return out.reset_index(drop=True)
 def threshold_tag(args: argparse.Namespace) -> str:
     return (
         "g2_%03d_g4_%03d_g51_%03d_g53_%03d"
@@ -172,12 +428,70 @@ def chulan_tag(args: argparse.Namespace) -> str:
     return "chulan{}".format(int(args.chulan))
 
 
+def side_aware_whitelist_tag(args: argparse.Namespace) -> str:
+    return "sidewl{}".format(int(bool(args.side_aware_whitelist)))
+
+
+def slots_tag(args: argparse.Namespace) -> str:
+    return "slot{}".format(int(args.slots))
+
+
+def conditional_side_aware_whitelist_tag(args: argparse.Namespace) -> str:
+    return "condwl{}".format(int(bool(getattr(args, "conditional_side_aware_whitelist", True))))
+
+
+def risk_sizing_tag(args: argparse.Namespace) -> str:
+    max_risk = float(getattr(args, "max_full_sl_capital_risk", 0.0) or 0.0)
+
+    if max_risk <= 0:
+        return "riskcap_off"
+
+    return "riskcap_%04d" % int(round(max_risk * 10000))
+
+
 def backtest_config_tag(args: argparse.Namespace) -> str:
-    return threshold_tag(args) + "__" + chulan_tag(args)
+    return "__".join(
+        [
+            threshold_tag(args),
+            chulan_tag(args),
+            side_aware_whitelist_tag(args),
+            conditional_side_aware_whitelist_tag(args),
+            slots_tag(args),
+            risk_sizing_tag(args),
+        ]
+    )
 
 
 def default_blacklist_source(args: argparse.Namespace) -> str:
     return "backtest_approved__" + threshold_tag(args)
+
+
+def is_symbol_research_mode(args: argparse.Namespace) -> bool:
+    return bool(str(getattr(args, "symbols", "") or "").strip())
+
+
+def apply_symbol_research_mode(args: argparse.Namespace) -> argparse.Namespace:
+    if not is_symbol_research_mode(args):
+        args.backtest_mode = "PORTFOLIO"
+        return args
+
+    args.backtest_mode = "SYMBOL_RESEARCH"
+
+    # In symbol research mode we test selected symbols directly.
+    # Portfolio admission lists and dynamic blacklist must not affect the result.
+    args.ignore_db_blacklist = True
+    args.side_aware_whitelist = False
+    args.conditional_side_aware_whitelist = False
+    args.write_dynamic_blacklist = False
+    args.reset_backtest_blacklist = False
+
+    if args.chulan is None:
+        args.chulan = 0
+
+    if args.slots is None:
+        args.slots = 1
+
+    return args
 
 
 def get_chulan_symbols() -> set:
@@ -546,6 +860,12 @@ def load_candidates(args: argparse.Namespace) -> pd.DataFrame:
             g2.up_reach_high_proba AS gate2_up,
             g2.dn_reach_high_proba AS gate2_dn,
 
+            CASE
+                WHEN UPPER(g51.side) = 'LONG' THEN g2.up_reach_high_proba - g2.dn_reach_high_proba
+                WHEN UPPER(g51.side) = 'SHORT' THEN g2.dn_reach_high_proba - g2.up_reach_high_proba
+                ELSE NULL
+            END AS gate2_side_margin,
+
             g51.gate4_confidence,
             g51.gate5_1_proba,
             g53.gate5_3_proba,
@@ -610,6 +930,7 @@ def load_candidates(args: argparse.Namespace) -> pd.DataFrame:
         "gate2_for_side_proba",
         "gate2_up",
         "gate2_dn",
+        "gate2_side_margin",
         "gate4_confidence",
         "gate5_1_proba",
         "gate5_3_proba",
@@ -637,7 +958,74 @@ def load_candidates(args: argparse.Namespace) -> pd.DataFrame:
     df = df[df["h4_close"] > 0].copy()
     df = df[df["atr14"] > 0].copy()
 
+    df = apply_symbol_side_filters(df, args)
+
     return df.reset_index(drop=True)
+
+
+def normalize_side_for_whitelist(side: str) -> str:
+    side_u = str(side or "").strip().upper()
+
+    if side_u == "BUY":
+        return "LONG"
+
+    if side_u == "SELL":
+        return "SHORT"
+
+    return side_u
+
+
+def get_conditional_side_rule(symbol: str, side: str) -> Optional[Dict[str, float]]:
+    rules = CONDITIONAL_SIDE_AWARE_WHITELIST or {}
+    symbol_u = str(symbol or "").strip().upper()
+    side_u = normalize_side_for_whitelist(side)
+
+    symbol_rules = rules.get(symbol_u)
+
+    if not isinstance(symbol_rules, dict):
+        return None
+
+    side_rule = symbol_rules.get(side_u)
+
+    if not isinstance(side_rule, dict):
+        return None
+
+    return side_rule
+
+
+def get_side_admission(
+    row: pd.Series,
+    use_regular_whitelist: bool,
+    use_conditional_whitelist: bool,
+) -> Tuple[bool, str, str]:
+    symbol = str(row.get("symbol") or "").strip().upper()
+    side = normalize_side_for_whitelist(str(row.get("side") or ""))
+
+    if use_regular_whitelist:
+        allowed_sides = [
+            normalize_side_for_whitelist(x)
+            for x in SIDE_AWARE_WHITELIST.get(symbol, [])
+        ]
+
+        if side in allowed_sides:
+            return True, "CURRENT_WHITELIST", ""
+
+    if use_conditional_whitelist:
+        rule = get_conditional_side_rule(symbol=symbol, side=side)
+
+        if rule is not None:
+            margin = row.get("gate2_side_margin")
+            min_margin = float(rule.get("min_gate2_side_margin", 0.0) or 0.0)
+
+            if pd.isna(margin):
+                return False, "", "MISSING_GATE2_SIDE_MARGIN"
+
+            if float(margin) < min_margin:
+                return False, "", "BELOW_CONDITIONAL_GATE2_MARGIN"
+
+            return True, "CONDITIONAL_WHITELIST", ""
+
+    return False, "", "NO_WHITELIST"
 
 
 def apply_thresholds(df: pd.DataFrame, args: argparse.Namespace, db_blacklist: set) -> pd.DataFrame:
@@ -651,6 +1039,54 @@ def apply_thresholds(df: pd.DataFrame, args: argparse.Namespace, db_blacklist: s
         & (df["gate5_3_proba"] >= float(args.gate5_3))
     ].copy()
 
+    gate2_side_margin_min = float(getattr(args, "gate2_side_margin_min", 0.0) or 0.0)
+
+    if gate2_side_margin_min > 0.0:
+        columns = set(out.columns)
+
+        if "gate2_margin_abs" in columns:
+            gate2_margin_series = pd.to_numeric(
+                out["gate2_margin_abs"],
+                errors="coerce",
+            ).abs()
+
+        elif "gate2_side_margin" in columns:
+            gate2_margin_series = pd.to_numeric(
+                out["gate2_side_margin"],
+                errors="coerce",
+            ).abs()
+
+        elif {"gate2_up", "gate2_dn"}.issubset(columns):
+            gate2_margin_series = (
+                pd.to_numeric(out["gate2_up"], errors="coerce")
+                - pd.to_numeric(out["gate2_dn"], errors="coerce")
+            ).abs()
+
+        elif {"gate2_up_proba", "gate2_dn_proba"}.issubset(columns):
+            gate2_margin_series = (
+                pd.to_numeric(out["gate2_up_proba"], errors="coerce")
+                - pd.to_numeric(out["gate2_dn_proba"], errors="coerce")
+            ).abs()
+
+        elif {"up_reach_high_proba", "dn_reach_high_proba"}.issubset(columns):
+            gate2_margin_series = (
+                pd.to_numeric(out["up_reach_high_proba"], errors="coerce")
+                - pd.to_numeric(out["dn_reach_high_proba"], errors="coerce")
+            ).abs()
+
+        else:
+            raise RuntimeError(
+                "--gate2-side-margin-min requires one of columns: "
+                "gate2_margin_abs, gate2_side_margin, gate2_up/gate2_dn, "
+                "gate2_up_proba/gate2_dn_proba, "
+                "up_reach_high_proba/dn_reach_high_proba. "
+                "available_columns={}".format(sorted(list(out.columns)))
+            )
+
+        out = out[
+            gate2_margin_series.fillna(0.0) >= gate2_side_margin_min
+        ].copy()
+
     excluded = set(parse_symbol_list(args.exclude_symbols))
 
     if not bool(args.ignore_db_blacklist):
@@ -659,7 +1095,34 @@ def apply_thresholds(df: pd.DataFrame, args: argparse.Namespace, db_blacklist: s
     if excluded:
         out = out[~out["symbol"].astype(str).str.upper().isin(excluded)].copy()
 
+    use_regular_whitelist = bool(args.side_aware_whitelist)
+    use_conditional_whitelist = bool(getattr(args, "conditional_side_aware_whitelist", True))
+
+    out["side_admission_source"] = ""
+    out["side_admission_reject_reason"] = ""
+
+    if use_regular_whitelist or use_conditional_whitelist:
+        keep_mask = []
+
+        for idx, row in out.iterrows():
+            allowed, source, reject_reason = get_side_admission(
+                row=row,
+                use_regular_whitelist=use_regular_whitelist,
+                use_conditional_whitelist=use_conditional_whitelist,
+            )
+
+            keep_mask.append(bool(allowed))
+
+            if allowed:
+                out.at[idx, "side_admission_source"] = source
+            else:
+                out.at[idx, "side_admission_reject_reason"] = reject_reason
+
+        out = out[pd.Series(keep_mask, index=out.index)].copy()
+
     return out.reset_index(drop=True)
+
+
 def keep_best_signal_per_h4(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -693,6 +1156,100 @@ def calc_tp_sl(side: str, entry_px: float, atr14: float, tp_atr: float, sl_atr: 
     raise RuntimeError("bad side: {}".format(side))
 
 
+def directional_return(
+    side: str,
+    entry_px: float,
+    exit_px: float,
+) -> float:
+    side_u = str(side).upper()
+    entry = float(entry_px)
+    exit_value = float(exit_px)
+
+    if entry <= 0 or exit_value <= 0:
+        raise RuntimeError(
+            "bad directional return prices: entry={} exit={}".format(
+                entry_px,
+                exit_px,
+            )
+        )
+
+    if side_u == "LONG":
+        return float((exit_value / entry) - 1.0)
+
+    if side_u == "SHORT":
+        return float((entry / exit_value) - 1.0)
+
+    raise RuntimeError("bad side: {}".format(side))
+
+
+def calc_position_sizing_from_full_sl(
+    side: str,
+    entry_px: float,
+    main_sl_px: float,
+    round_trip_cost: float,
+    max_full_sl_capital_risk: float,
+) -> Dict[str, float]:
+    max_risk = float(max_full_sl_capital_risk or 0.0)
+
+    full_main_sl_gross_ret = directional_return(
+        side=side,
+        entry_px=entry_px,
+        exit_px=main_sl_px,
+    )
+
+    full_main_sl_net_ret = float(full_main_sl_gross_ret - float(round_trip_cost))
+    full_main_sl_capital_risk_abs = float(abs(min(full_main_sl_net_ret, 0.0)))
+
+    if max_risk <= 0 or full_main_sl_capital_risk_abs <= 0:
+        position_fraction = 1.0
+    elif full_main_sl_capital_risk_abs <= max_risk:
+        position_fraction = 1.0
+    else:
+        position_fraction = float(max_risk / full_main_sl_capital_risk_abs)
+
+    position_fraction = min(1.0, max(0.0, float(position_fraction)))
+
+    return {
+        "position_fraction": float(position_fraction),
+        "max_full_sl_capital_risk": float(max_risk),
+        "full_main_sl_gross_ret": float(full_main_sl_gross_ret),
+        "full_main_sl_net_ret": float(full_main_sl_net_ret),
+        "full_main_sl_capital_risk_abs": float(full_main_sl_capital_risk_abs),
+        "position_fraction_cap_applied": float(position_fraction < 0.999999),
+    }
+
+
+def price_level_hit(
+    side: str,
+    level_kind: str,
+    level_px: float,
+    high: float,
+    low: float,
+) -> bool:
+    side_u = str(side).upper()
+    kind_u = str(level_kind).upper()
+    level = float(level_px)
+
+    if side_u == "LONG" and kind_u == "PROFIT":
+        return float(high) >= level
+
+    if side_u == "LONG" and kind_u == "LOSS":
+        return float(low) <= level
+
+    if side_u == "SHORT" and kind_u == "PROFIT":
+        return float(low) <= level
+
+    if side_u == "SHORT" and kind_u == "LOSS":
+        return float(high) >= level
+
+    raise RuntimeError(
+        "bad side/level_kind: {} {}".format(
+            side,
+            level_kind,
+        )
+    )
+
+
 def simulate_one(
     row: pd.Series,
     args: argparse.Namespace,
@@ -703,10 +1260,22 @@ def simulate_one(
     symbol = str(row["symbol"]).upper()
     side = str(row["side"]).upper()
 
-    signal_ts = pd.to_datetime(row["signal_ts"], utc=True)
+    signal_ts = pd.to_datetime(
+        row["signal_ts"],
+        utc=True,
+    )
 
-    entry_ts = signal_ts + pd.Timedelta(seconds=H4_SECONDS + int(args.entry_delay_seconds))
-    ttl_end_ts = entry_ts + pd.Timedelta(hours=int(args.ttl_hours))
+    entry_ts = (
+        signal_ts
+        + pd.Timedelta(seconds=H4_SECONDS)
+        + pd.Timedelta(
+            seconds=int(args.entry_delay_seconds)
+        )
+    )
+
+    ttl_end_ts = entry_ts + pd.Timedelta(
+        hours=float(args.ttl_hours)
+    )
 
     m1 = read_m1_from_db(
         symbol=symbol,
@@ -718,7 +1287,11 @@ def simulate_one(
     if m1 is None or m1.empty:
         return None
 
-    window = m1[(m1["ts"] >= entry_ts) & (m1["ts"] <= ttl_end_ts)].copy()
+    window = m1[
+        (m1["ts"] >= entry_ts)
+        & (m1["ts"] <= ttl_end_ts)
+    ].copy()
+
     if window.empty:
         return None
 
@@ -731,72 +1304,592 @@ def simulate_one(
     if not np.isfinite(atr14) or atr14 <= 0:
         return None
 
-    tp_px, sl_px = calc_tp_sl(
+    use_partial = bool(
+        getattr(config, "PARTIAL_TP_ENABLED", False)
+    )
+
+    use_early_stop = bool(
+        getattr(config, "EARLY_STOP_ENABLED", False)
+    )
+
+    use_main_stop = bool(
+        getattr(
+            config,
+            "MAIN_STOP_AFTER_EARLY_WINDOW_ENABLED",
+            True,
+        )
+    )
+
+    use_rest_stop = bool(
+        getattr(
+            config,
+            "REST_STOP_AFTER_PARTIAL_ENABLED",
+            True,
+        )
+    )
+
+    partial_level_fraction = float(
+        getattr(
+            config,
+            "PARTIAL_TP_LEVEL_FRACTION",
+            0.75,
+        )
+    )
+
+    partial_qty_fraction = float(
+        getattr(
+            config,
+            "PARTIAL_TP_QTY_FRACTION",
+            0.5,
+        )
+    )
+
+    early_stop_sl_fraction = float(
+        getattr(
+            config,
+            "EARLY_STOP_SL_FRACTION",
+            0.5,
+        )
+    )
+
+    early_stop_window_minutes = int(
+        getattr(
+            config,
+            "EARLY_STOP_WINDOW_MINUTES",
+            60,
+        )
+    )
+
+    rest_stop_atr_mult = float(
+        getattr(
+            config,
+            "REST_STOP_AFTER_PARTIAL_ATR_MULT",
+            float(args.tp_atr) * 0.125,
+        )
+    )
+
+    partial_qty_fraction = min(
+        1.0,
+        max(0.0, partial_qty_fraction),
+    )
+
+    final_qty_fraction = (
+        1.0 - partial_qty_fraction
+        if use_partial
+        else 1.0
+    )
+
+    if (
+        not use_partial
+        or partial_qty_fraction <= 0
+        or final_qty_fraction <= 0
+    ):
+        use_partial = False
+        partial_qty_fraction = 0.0
+        final_qty_fraction = 1.0
+
+    partial_tp_atr = (
+        float(args.tp_atr)
+        * partial_level_fraction
+    )
+
+    final_tp_atr = float(args.tp_atr)
+
+    early_stop_atr = (
+        float(args.sl_atr)
+        * early_stop_sl_fraction
+    )
+
+    main_sl_atr = float(args.sl_atr)
+
+    partial_tp_px, _ = calc_tp_sl(
         side=side,
         entry_px=entry_px,
         atr14=atr14,
-        tp_atr=float(args.tp_atr),
-        sl_atr=float(args.sl_atr),
+        tp_atr=partial_tp_atr,
+        sl_atr=main_sl_atr,
     )
 
+    final_tp_px, main_sl_px = calc_tp_sl(
+        side=side,
+        entry_px=entry_px,
+        atr14=atr14,
+        tp_atr=final_tp_atr,
+        sl_atr=main_sl_atr,
+    )
+
+    _, early_stop_px = calc_tp_sl(
+        side=side,
+        entry_px=entry_px,
+        atr14=atr14,
+        tp_atr=final_tp_atr,
+        sl_atr=early_stop_atr,
+    )
+
+    round_trip_cost_full_position = (
+        2.0 * float(args.fee_side)
+        + 2.0 * float(args.slippage_side)
+    )
+
+    position_sizing = calc_position_sizing_from_full_sl(
+        side=side,
+        entry_px=entry_px,
+        main_sl_px=main_sl_px,
+        round_trip_cost=round_trip_cost_full_position,
+        max_full_sl_capital_risk=float(
+            getattr(args, "max_full_sl_capital_risk", 0.0) or 0.0
+        ),
+    )
+
+    position_fraction = float(position_sizing["position_fraction"])
+
+    if side == "LONG":
+        rest_stop_px = (
+            entry_px
+            + atr14 * rest_stop_atr_mult
+        )
+    else:
+        rest_stop_px = (
+            entry_px
+            - atr14 * rest_stop_atr_mult
+        )
+
+    early_stop_expires_at = entry_ts + pd.Timedelta(
+        minutes=early_stop_window_minutes
+    )
+
+    partial_tp_hit = False
+    partial_tp_ts = pd.NaT
+    partial_tp_exit_px = np.nan
+
+    final_tp_hit = False
+    final_tp_ts = pd.NaT
+    final_tp_exit_px = np.nan
+
+    early_stop_hit = False
+    early_stop_ts = pd.NaT
+
+    main_sl_hit = False
+    main_sl_ts = pd.NaT
+
+    rest_stop_hit = False
+    rest_stop_ts = pd.NaT
+
+    rest_stop_active_from = pd.NaT
+
     exit_reason = "TTL"
-    exit_ts = pd.to_datetime(window.iloc[-1]["ts"], utc=True)
-    exit_px = float(window.iloc[-1]["close"])
+    exit_ts = pd.to_datetime(
+        window.iloc[-1]["ts"],
+        utc=True,
+    )
+
+    exit_legs: List[Dict[str, object]] = []
+
+    remaining_fraction = 1.0
+    terminal = False
 
     for _, bar in window.iterrows():
-        ts = pd.to_datetime(bar["ts"], utc=True)
+        ts = pd.to_datetime(
+            bar["ts"],
+            utc=True,
+        )
+
         high = float(bar["high"])
         low = float(bar["low"])
 
-        if side == "LONG":
-            tp_hit = high >= tp_px
-            sl_hit = low <= sl_px
+        if not partial_tp_hit:
+            if (
+                use_early_stop
+                and ts < early_stop_expires_at
+            ):
+                active_stop_px = early_stop_px
+                active_stop_reason = "EARLY_STOP"
+            elif use_main_stop or not use_early_stop:
+                active_stop_px = main_sl_px
+                active_stop_reason = "MAIN_SL"
+            else:
+                active_stop_px = None
+                active_stop_reason = None
+
+            stop_hit = False
+
+            if active_stop_px is not None:
+                stop_hit = price_level_hit(
+                    side=side,
+                    level_kind="LOSS",
+                    level_px=float(active_stop_px),
+                    high=high,
+                    low=low,
+                )
+
+            partial_hit_now = (
+                use_partial
+                and price_level_hit(
+                    side=side,
+                    level_kind="PROFIT",
+                    level_px=partial_tp_px,
+                    high=high,
+                    low=low,
+                )
+            )
+
+            final_hit_now = price_level_hit(
+                side=side,
+                level_kind="PROFIT",
+                level_px=final_tp_px,
+                high=high,
+                low=low,
+            )
+
+            if stop_hit:
+                exit_legs.append(
+                    {
+                        "role": active_stop_reason,
+                        "fraction": float(remaining_fraction),
+                        "px": float(active_stop_px),
+                        "ts": ts,
+                    }
+                )
+
+                exit_reason = str(active_stop_reason)
+                exit_ts = ts
+
+                if active_stop_reason == "EARLY_STOP":
+                    early_stop_hit = True
+                    early_stop_ts = ts
+                else:
+                    main_sl_hit = True
+                    main_sl_ts = ts
+
+                remaining_fraction = 0.0
+                terminal = True
+                break
+
+            if final_hit_now:
+                if use_partial:
+                    exit_legs.append(
+                        {
+                            "role": "PARTIAL_TP",
+                            "fraction": float(
+                                partial_qty_fraction
+                            ),
+                            "px": float(partial_tp_px),
+                            "ts": ts,
+                        }
+                    )
+
+                    exit_legs.append(
+                        {
+                            "role": "FINAL_TP",
+                            "fraction": float(
+                                final_qty_fraction
+                            ),
+                            "px": float(final_tp_px),
+                            "ts": ts,
+                        }
+                    )
+
+                    partial_tp_hit = True
+                    partial_tp_ts = ts
+                    partial_tp_exit_px = float(
+                        partial_tp_px
+                    )
+
+                    final_tp_hit = True
+                    final_tp_ts = ts
+                    final_tp_exit_px = float(
+                        final_tp_px
+                    )
+
+                    exit_reason = (
+                        "PARTIAL_TP_THEN_FINAL_TP"
+                    )
+                else:
+                    exit_legs.append(
+                        {
+                            "role": "FINAL_TP",
+                            "fraction": 1.0,
+                            "px": float(final_tp_px),
+                            "ts": ts,
+                        }
+                    )
+
+                    final_tp_hit = True
+                    final_tp_ts = ts
+                    final_tp_exit_px = float(
+                        final_tp_px
+                    )
+
+                    exit_reason = "FINAL_TP"
+
+                exit_ts = ts
+                remaining_fraction = 0.0
+                terminal = True
+                break
+
+            if partial_hit_now:
+                exit_legs.append(
+                    {
+                        "role": "PARTIAL_TP",
+                        "fraction": float(
+                            partial_qty_fraction
+                        ),
+                        "px": float(partial_tp_px),
+                        "ts": ts,
+                    }
+                )
+
+                partial_tp_hit = True
+                partial_tp_ts = ts
+                partial_tp_exit_px = float(
+                    partial_tp_px
+                )
+
+                remaining_fraction = float(
+                    final_qty_fraction
+                )
+
+                if use_rest_stop:
+                    rest_stop_active_from = (
+                        ts + pd.Timedelta(minutes=1)
+                    )
+
+                continue
+
         else:
-            tp_hit = low <= tp_px
-            sl_hit = high >= sl_px
+            final_hit_now = price_level_hit(
+                side=side,
+                level_kind="PROFIT",
+                level_px=final_tp_px,
+                high=high,
+                low=low,
+            )
 
-        if tp_hit and sl_hit:
-            exit_reason = "SL_SAME_M1"
-            exit_px = sl_px
-            exit_ts = ts
-            break
+            rest_is_active = (
+                use_rest_stop
+                and pd.notna(rest_stop_active_from)
+                and ts >= rest_stop_active_from
+            )
 
-        if tp_hit:
-            exit_reason = "TP"
-            exit_px = tp_px
-            exit_ts = ts
-            break
+            rest_hit_now = (
+                rest_is_active
+                and price_level_hit(
+                    side=side,
+                    level_kind="LOSS",
+                    level_px=rest_stop_px,
+                    high=high,
+                    low=low,
+                )
+            )
 
-        if sl_hit:
-            exit_reason = "SL"
-            exit_px = sl_px
-            exit_ts = ts
-            break
+            if rest_hit_now:
+                exit_legs.append(
+                    {
+                        "role": (
+                            "REST_STOP_AFTER_PARTIAL"
+                        ),
+                        "fraction": float(
+                            remaining_fraction
+                        ),
+                        "px": float(rest_stop_px),
+                        "ts": ts,
+                    }
+                )
 
-    if side == "LONG":
-        gross_ret = (exit_px / entry_px) - 1.0
+                rest_stop_hit = True
+                rest_stop_ts = ts
+                exit_reason = (
+                    "PARTIAL_TP_THEN_REST_STOP"
+                )
+                exit_ts = ts
+                remaining_fraction = 0.0
+                terminal = True
+                break
+
+            if final_hit_now:
+                exit_legs.append(
+                    {
+                        "role": "FINAL_TP",
+                        "fraction": float(
+                            remaining_fraction
+                        ),
+                        "px": float(final_tp_px),
+                        "ts": ts,
+                    }
+                )
+
+                final_tp_hit = True
+                final_tp_ts = ts
+                final_tp_exit_px = float(
+                    final_tp_px
+                )
+
+                exit_reason = (
+                    "PARTIAL_TP_THEN_FINAL_TP"
+                )
+                exit_ts = ts
+                remaining_fraction = 0.0
+                terminal = True
+                break
+
+    if not terminal and remaining_fraction > 0:
+        ttl_exit_px = float(
+            window.iloc[-1]["close"]
+        )
+
+        ttl_exit_ts = pd.to_datetime(
+            window.iloc[-1]["ts"],
+            utc=True,
+        )
+
+        exit_legs.append(
+            {
+                "role": "TTL",
+                "fraction": float(
+                    remaining_fraction
+                ),
+                "px": ttl_exit_px,
+                "ts": ttl_exit_ts,
+            }
+        )
+
+        exit_ts = ttl_exit_ts
+
+        if partial_tp_hit:
+            exit_reason = "PARTIAL_TP_THEN_TTL"
+        else:
+            exit_reason = "TTL"
+
+        remaining_fraction = 0.0
+
+    gross_ret = 0.0
+    weighted_exit_px = 0.0
+    exit_fraction_sum = 0.0
+
+    for leg in exit_legs:
+        fraction = float(leg["fraction"])
+        leg_px = float(leg["px"])
+
+        gross_ret += (
+            fraction
+            * directional_return(
+                side=side,
+                entry_px=entry_px,
+                exit_px=leg_px,
+            )
+        )
+
+        weighted_exit_px += fraction * leg_px
+        exit_fraction_sum += fraction
+
+    if exit_fraction_sum <= 0:
+        return None
+
+    exit_px = weighted_exit_px / exit_fraction_sum
+
+    round_trip_cost = float(round_trip_cost_full_position)
+
+    raw_gross_ret = float(gross_ret)
+    raw_round_trip_cost = float(round_trip_cost)
+    raw_net_ret = float(raw_gross_ret - raw_round_trip_cost)
+
+    gross_ret = float(raw_gross_ret * position_fraction)
+    round_trip_cost = float(raw_round_trip_cost * position_fraction)
+    net_ret = float(raw_net_ret * position_fraction)
+
+    if exit_reason in {
+        "FINAL_TP",
+        "PARTIAL_TP_THEN_FINAL_TP",
+        "PARTIAL_TP_THEN_REST_STOP",
+    }:
+        outcome_bucket = "TP"
+    elif exit_reason in {
+        "EARLY_STOP",
+        "MAIN_SL",
+    }:
+        outcome_bucket = "SL"
     else:
-        gross_ret = (entry_px / exit_px) - 1.0
-
-    net_ret = gross_ret - 2.0 * float(args.fee_side) - 2.0 * float(args.slippage_side)
+        outcome_bucket = "TTL"
 
     out = row.to_dict()
+
     out.update(
         {
             "entry_ts": entry_ts,
             "ttl_end_ts": ttl_end_ts,
             "exit_ts": exit_ts,
             "entry_px": float(entry_px),
-            "tp_px": float(tp_px),
-            "sl_px": float(sl_px),
+            "tp_px": float(final_tp_px),
+            "sl_px": float(main_sl_px),
+            "partial_tp_px": float(partial_tp_px),
+            "final_tp_px": float(final_tp_px),
+            "early_stop_px": float(early_stop_px),
+            "main_sl_px": float(main_sl_px),
+            "rest_stop_after_partial_px": float(
+                rest_stop_px
+            ),
+            "early_stop_expires_at": (
+                early_stop_expires_at
+            ),
+            "partial_tp_qty_fraction": float(
+                partial_qty_fraction
+            ),
+            "final_tp_qty_fraction": float(
+                final_qty_fraction
+            ),
+            "partial_tp_hit": bool(partial_tp_hit),
+            "partial_tp_ts": partial_tp_ts,
+            "partial_tp_exit_px": (
+                partial_tp_exit_px
+            ),
+            "final_tp_hit": bool(final_tp_hit),
+            "final_tp_ts": final_tp_ts,
+            "final_tp_exit_px": final_tp_exit_px,
+            "early_stop_hit": bool(early_stop_hit),
+            "early_stop_ts": early_stop_ts,
+            "main_sl_hit": bool(main_sl_hit),
+            "main_sl_ts": main_sl_ts,
+            "rest_stop_hit": bool(rest_stop_hit),
+            "rest_stop_ts": rest_stop_ts,
+            "rest_stop_active_from": (
+                rest_stop_active_from
+            ),
             "exit_px": float(exit_px),
-            "exit_reason": exit_reason,
+            "exit_reason": str(exit_reason),
+            "outcome_bucket": outcome_bucket,
+            "exit_legs_json": json.dumps(
+                exit_legs,
+                ensure_ascii=False,
+                default=str,
+            ),
+            "raw_gross_ret": float(raw_gross_ret),
+            "raw_round_trip_cost": float(raw_round_trip_cost),
+            "raw_net_ret": float(raw_net_ret),
+            "position_fraction": float(position_fraction),
+            "max_full_sl_capital_risk": float(position_sizing["max_full_sl_capital_risk"]),
+            "full_main_sl_gross_ret": float(position_sizing["full_main_sl_gross_ret"]),
+            "full_main_sl_net_ret": float(position_sizing["full_main_sl_net_ret"]),
+            "full_main_sl_capital_risk_abs": float(position_sizing["full_main_sl_capital_risk_abs"]),
+            "position_fraction_cap_applied": bool(position_sizing["position_fraction_cap_applied"]),
             "gross_ret": float(gross_ret),
+            "round_trip_cost": float(
+                round_trip_cost
+            ),
             "net_ret": float(net_ret),
+            "trade_management_mode": (
+                "partial75_early_stop"
+                if use_partial or use_early_stop
+                else "legacy_full_tp_sl"
+            ),
+            "same_m1_policy": (
+                "adverse_stop_first;"
+                "rest_stop_active_next_m1"
+            ),
         }
     )
 
     return out
+
 
 
 def simulate_candidates(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
@@ -850,7 +1943,11 @@ def run_slot1_full_compound(sim: pd.DataFrame, args: argparse.Namespace) -> Tupl
             "skipped_overlap": 0,
             "skipped_dynamic_blacklist": 0,
             "chulan": int(args.chulan),
+            "side_aware_whitelist": bool(args.side_aware_whitelist),
+            "conditional_side_aware_whitelist": bool(getattr(args, "conditional_side_aware_whitelist", True)),
+            "slots": int(args.slots),
             "blacklist_source": str(args.blacklist_source),
+            "max_full_sl_capital_risk": float(getattr(args, "max_full_sl_capital_risk", 0.0) or 0.0),
         }
 
     capital = float(args.capital)
@@ -861,7 +1958,8 @@ def run_slot1_full_compound(sim: pd.DataFrame, args: argparse.Namespace) -> Tupl
     skipped_overlap = 0
     skipped_dynamic_blacklist = 0
 
-    write_dynamic_blacklist = bool(getattr(args, "write_dynamic_blacklist", False))
+    symbol_research_mode = is_symbol_research_mode(args)
+    write_dynamic_blacklist = bool(getattr(args, "write_dynamic_blacklist", False)) and not symbol_research_mode
     blacklist_source = str(getattr(args, "blacklist_source", "backtest_approved"))
 
     for _, row in sim.sort_values(["entry_ts", "signal_strength"], ascending=[True, False]).iterrows():
@@ -872,11 +1970,16 @@ def run_slot1_full_compound(sim: pd.DataFrame, args: argparse.Namespace) -> Tupl
             skipped_overlap += 1
             continue
 
-        allowed, dynamic_reason, dynamic_stats = is_symbol_allowed(
-            symbol=str(row["symbol"]),
-            source=blacklist_source,
-            now_ts=entry_ts,
-        )
+        if symbol_research_mode:
+            allowed = True
+            dynamic_reason = "symbol_research_mode_disabled"
+            dynamic_stats = {}
+        else:
+            allowed, dynamic_reason, dynamic_stats = is_symbol_allowed(
+                symbol=str(row["symbol"]),
+                source=blacklist_source,
+                now_ts=entry_ts,
+            )
 
         if not allowed:
             skipped_dynamic_blacklist += 1
@@ -940,6 +2043,10 @@ def run_slot1_full_compound(sim: pd.DataFrame, args: argparse.Namespace) -> Tupl
             "dynamic_blacklist_written": bool(write_dynamic_blacklist),
             "blacklist_source": blacklist_source,
             "chulan": int(args.chulan),
+            "side_aware_whitelist": bool(args.side_aware_whitelist),
+            "conditional_side_aware_whitelist": bool(getattr(args, "conditional_side_aware_whitelist", True)),
+            "slots": int(args.slots),
+            "max_full_sl_capital_risk": float(getattr(args, "max_full_sl_capital_risk", 0.0) or 0.0),
         }
 
     wins = trades_df[trades_df["net_ret"] > 0]
@@ -948,6 +2055,10 @@ def run_slot1_full_compound(sim: pd.DataFrame, args: argparse.Namespace) -> Tupl
     gross_profit = float(wins["pnl_usd"].sum()) if len(wins) else 0.0
     gross_loss_abs = float(abs(losses["pnl_usd"].sum())) if len(losses) else 0.0
     profit_factor = gross_profit / gross_loss_abs if gross_loss_abs > 0 else None
+
+    capped_position_trades = int(trades_df["position_fraction_cap_applied"].fillna(False).astype(bool).sum()) if "position_fraction_cap_applied" in trades_df.columns else 0
+    min_position_fraction = float(trades_df["position_fraction"].min()) if "position_fraction" in trades_df.columns and len(trades_df) else 1.0
+    mean_position_fraction = float(trades_df["position_fraction"].mean()) if "position_fraction" in trades_df.columns and len(trades_df) else 1.0
 
     summary = {
         "trades_taken": int(len(trades_df)),
@@ -958,14 +2069,27 @@ def run_slot1_full_compound(sim: pd.DataFrame, args: argparse.Namespace) -> Tupl
         "max_drawdown_pct": float(max_dd),
         "mean_net_ret": float(trades_df["net_ret"].mean()),
         "median_net_ret": float(trades_df["net_ret"].median()),
-        "tp_count": int((trades_df["exit_reason"] == "TP").sum()),
-        "sl_count": int(trades_df["exit_reason"].astype(str).str.startswith("SL").sum()),
-        "ttl_count": int((trades_df["exit_reason"] == "TTL").sum()),
+        "max_full_sl_capital_risk": float(getattr(args, "max_full_sl_capital_risk", 0.0) or 0.0),
+        "capped_position_trades": int(capped_position_trades),
+        "min_position_fraction": float(min_position_fraction),
+        "mean_position_fraction": float(mean_position_fraction),
+        "tp_count": int((trades_df["outcome_bucket"] == "TP").sum()),
+        "sl_count": int((trades_df["outcome_bucket"] == "SL").sum()),
+        "ttl_count": int((trades_df["outcome_bucket"] == "TTL").sum()),
+        "partial_tp_trades": int(trades_df["partial_tp_hit"].fillna(False).astype(bool).sum()),
+        "partial_tp_then_final_tp": int((trades_df["exit_reason"] == "PARTIAL_TP_THEN_FINAL_TP").sum()),
+        "partial_tp_then_rest_stop": int((trades_df["exit_reason"] == "PARTIAL_TP_THEN_REST_STOP").sum()),
+        "partial_tp_then_ttl": int((trades_df["exit_reason"] == "PARTIAL_TP_THEN_TTL").sum()),
+        "early_stop_count": int((trades_df["exit_reason"] == "EARLY_STOP").sum()),
+        "main_sl_count": int((trades_df["exit_reason"] == "MAIN_SL").sum()),
         "skipped_overlap": int(skipped_overlap),
         "skipped_dynamic_blacklist": int(skipped_dynamic_blacklist),
         "dynamic_blacklist_written": bool(write_dynamic_blacklist),
         "blacklist_source": blacklist_source,
         "chulan": int(args.chulan),
+        "side_aware_whitelist": bool(args.side_aware_whitelist),
+        "conditional_side_aware_whitelist": bool(getattr(args, "conditional_side_aware_whitelist", True)),
+        "slots": int(args.slots),
         "first_entry_ts": str(trades_df["entry_ts"].min()),
         "last_exit_ts": str(trades_df["exit_ts"].max()),
     }
@@ -1009,6 +2133,22 @@ def save_outputs(
 
     print("WROTE:", trades_path)
 
+    try:
+        xlsx_path = export_backtest_xlsx(
+            raw=raw,
+            passed=passed,
+            selected=selected,
+            sim=sim,
+            trades=trades,
+            summary=summary,
+            args=args,
+        )
+
+        print("WROTE_XLSX:", xlsx_path)
+
+    except Exception as exc:
+        print("BACKTEST_XLSX_EXPORT_ERROR:", repr(exc))
+
 def print_report(
     raw: pd.DataFrame,
     passed: pd.DataFrame,
@@ -1021,19 +2161,29 @@ def print_report(
     print("=" * 120)
     print("M1 BACKTEST THRESHOLDS")
     print("=" * 120)
+    print("backtest_mode:", str(getattr(args, "backtest_mode", "PORTFOLIO")))
     print("period:", args.start, "->", args.end)
+    print("symbols_filter:", format_symbol_side_filters(str(getattr(args, "symbols", "") or "")))
     print("pair_model_name:", args.pair_model_name)
     print("grid_name:", args.grid_name)
     print("gate2:", args.gate2)
+    print("gate2_side_margin_min:", float(getattr(args, "gate2_side_margin_min", 0.0) or 0.0))
     print("gate4:", args.gate4)
     print("gate5_1:", args.gate5_1)
     print("gate5_3:", args.gate5_3)
     print("chulan:", int(args.chulan))
+    print("side_aware_whitelist:", bool(args.side_aware_whitelist))
+    print("side_aware_whitelist_symbols:", len(SIDE_AWARE_WHITELIST))
+    print("conditional_side_aware_whitelist:", bool(getattr(args, "conditional_side_aware_whitelist", True)))
+    print("conditional_side_aware_whitelist_symbols:", len(CONDITIONAL_SIDE_AWARE_WHITELIST))
+    print("max_full_sl_capital_risk:", float(getattr(args, "max_full_sl_capital_risk", 0.0) or 0.0))
+    print("slots:", int(args.slots))
     print("blacklist_source:", str(args.blacklist_source))
     print("tp_atr:", args.tp_atr)
     print("sl_atr:", args.sl_atr)
     print("ttl_hours:", args.ttl_hours)
     print("entry_delay_seconds:", args.entry_delay_seconds)
+    print("entry_rule:", "H4 close + 60s => second M1 open")
     print("fee_side:", args.fee_side)
     print("slippage_side:", args.slippage_side)
     print("m1_source:", M1_DB_TABLE)
@@ -1058,14 +2208,26 @@ def print_report(
         "max_drawdown_pct",
         "mean_net_ret",
         "median_net_ret",
+        "max_full_sl_capital_risk",
+        "capped_position_trades",
+        "min_position_fraction",
+        "mean_position_fraction",
         "tp_count",
         "sl_count",
         "ttl_count",
+        "partial_tp_trades",
+        "partial_tp_then_final_tp",
+        "partial_tp_then_rest_stop",
+        "partial_tp_then_ttl",
+        "early_stop_count",
+        "main_sl_count",
         "skipped_overlap",
         "skipped_dynamic_blacklist",
         "dynamic_blacklist_written",
         "blacklist_source",
         "chulan",
+        "side_aware_whitelist",
+        "slots",
         "first_entry_ts",
         "last_exit_ts",
     ]:
@@ -1088,10 +2250,24 @@ def print_report(
         "symbol",
         "side",
         "entry_px",
-        "tp_px",
-        "sl_px",
+        "partial_tp_px",
+        "final_tp_px",
+        "early_stop_px",
+        "main_sl_px",
+        "rest_stop_after_partial_px",
         "exit_px",
         "exit_reason",
+        "outcome_bucket",
+        "partial_tp_hit",
+        "final_tp_hit",
+        "early_stop_hit",
+        "main_sl_hit",
+        "rest_stop_hit",
+        "raw_net_ret",
+        "position_fraction",
+        "full_main_sl_capital_risk_abs",
+        "gross_ret",
+        "round_trip_cost",
         "net_ret",
         "capital_after",
         "gate2_for_side_proba",
@@ -1129,6 +2305,7 @@ def main() -> None:
     print_report(raw, passed, selected, sim, trades, summary, args)
 
     print("-" * 120)
+    print("BACKTEST_MODE:", str(getattr(args, "backtest_mode", "PORTFOLIO")))
     print("DB_ONLY_MODE:", True)
     print("M1_DB_TABLE:", M1_DB_TABLE)
     print("M1_AUTO_SYNC:", json.dumps(m1_sync_report, ensure_ascii=False, default=str))
@@ -1136,6 +2313,18 @@ def main() -> None:
     print("LEGACY_DB_BLACKLIST_SYMBOLS_COUNT:", len(db_blacklist))
     print("LEGACY_DB_BLACKLIST_SYMBOLS:", ",".join(sorted(db_blacklist)) if db_blacklist else "")
     print("DYNAMIC_BLACKLIST_SOURCE:", str(args.blacklist_source))
+    print("SIDE_AWARE_WHITELIST_ENABLED:", bool(args.side_aware_whitelist))
+    print("CONDITIONAL_SIDE_AWARE_WHITELIST_ENABLED:", bool(getattr(args, "conditional_side_aware_whitelist", True)))
+    print(
+        "SIDE_AWARE_WHITELIST:",
+        json.dumps(SIDE_AWARE_WHITELIST, ensure_ascii=False, sort_keys=True),
+    )
+    print(
+        "CONDITIONAL_SIDE_AWARE_WHITELIST:",
+        json.dumps(CONDITIONAL_SIDE_AWARE_WHITELIST, ensure_ascii=False, sort_keys=True),
+    )
+    print("MAX_FULL_SL_CAPITAL_RISK:", float(getattr(args, "max_full_sl_capital_risk", 0.0) or 0.0))
+    print("SLOTS:", int(args.slots))
     print("OUT_DIR:", args.out_dir)
 
 if __name__ == "__main__":

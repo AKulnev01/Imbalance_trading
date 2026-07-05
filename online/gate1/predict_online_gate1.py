@@ -14,6 +14,8 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 
+from online.oos_context import append_oos_sql_filters, get_online_oos_context
+
 try:
     from catboost import CatBoostClassifier, Pool
 except Exception as e:
@@ -277,6 +279,7 @@ def get_symbols_from_online_features() -> List[str]:
     symbols = [s for s in symbols if s not in EXCLUDED_SYMBOLS]
     return symbols
 
+
 def load_missing_feature_rows_batch(
     symbols: List[str],
     rebuild: bool,
@@ -287,14 +290,29 @@ def load_missing_feature_rows_batch(
 
     feature_table = sql_table(ONLINE_FEATURES_TABLE)
 
+    where_parts = ["UPPER(f.symbol) = ANY(%s)"]
+    params: List[object] = [symbols]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="f",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
+
     if rebuild:
         query = """
             SELECT f.*
             FROM {feature_table} f
-            WHERE UPPER(f.symbol) = ANY(%s)
+            WHERE {where_sql}
             ORDER BY f.symbol ASC, f.entry_ts ASC
-        """.format(feature_table=feature_table)
-        params = [symbols]
+        """.format(
+            feature_table=feature_table,
+            where_sql=where_sql,
+        )
     else:
         query = """
             SELECT f.*
@@ -302,11 +320,13 @@ def load_missing_feature_rows_batch(
             LEFT JOIN public.online_gate1_predictions p
               ON p.symbol = f.symbol
              AND p.entry_ts = f.entry_ts
-            WHERE UPPER(f.symbol) = ANY(%s)
+            WHERE {where_sql}
               AND p.symbol IS NULL
             ORDER BY f.symbol ASC, f.entry_ts ASC
-        """.format(feature_table=feature_table)
-        params = [symbols]
+        """.format(
+            feature_table=feature_table,
+            where_sql=where_sql,
+        )
 
     with connect_db() as conn:
         df = pd.read_sql_query(query, conn, params=params)
@@ -327,8 +347,6 @@ def load_missing_feature_rows_batch(
         )
 
     return df
-
-
 def split_feature_rows_by_symbol(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     if df.empty:
         return {}
@@ -341,17 +359,33 @@ def split_feature_rows_by_symbol(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     return result
 
 
+
 def get_missing_feature_rows(symbol: str, rebuild: bool, limit_latest: Optional[int]) -> pd.DataFrame:
     feature_table = sql_table(ONLINE_FEATURES_TABLE)
+
+    where_parts = ["f.symbol = %s"]
+    params: List[object] = [symbol]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="f",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
 
     if rebuild:
         query = """
             SELECT f.*
             FROM {feature_table} f
-            WHERE f.symbol = %s
+            WHERE {where_sql}
             ORDER BY f.entry_ts ASC
-        """.format(feature_table=feature_table)
-        params = [symbol]
+        """.format(
+            feature_table=feature_table,
+            where_sql=where_sql,
+        )
     else:
         query = """
             SELECT f.*
@@ -359,11 +393,13 @@ def get_missing_feature_rows(symbol: str, rebuild: bool, limit_latest: Optional[
             LEFT JOIN public.online_gate1_predictions p
               ON p.symbol = f.symbol
              AND p.entry_ts = f.entry_ts
-            WHERE f.symbol = %s
+            WHERE {where_sql}
               AND p.symbol IS NULL
             ORDER BY f.entry_ts ASC
-        """.format(feature_table=feature_table)
-        params = [symbol]
+        """.format(
+            feature_table=feature_table,
+            where_sql=where_sql,
+        )
 
     with connect_db() as conn:
         df = pd.read_sql_query(query, conn, params=params)
@@ -378,8 +414,6 @@ def get_missing_feature_rows(symbol: str, rebuild: bool, limit_latest: Optional[
         df = df.tail(int(limit_latest)).reset_index(drop=True)
 
     return df
-
-
 def prepare_x(df: pd.DataFrame, feature_names: List[str]) -> pd.DataFrame:
     missing = [c for c in feature_names if c not in df.columns]
     if missing:
@@ -578,12 +612,19 @@ def main() -> None:
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     create_predictions_table()
+    oos_ctx = get_online_oos_context()
 
     if args.symbol.strip():
         symbols = [args.symbol.strip().upper()]
+    elif oos_ctx.enabled:
+        symbols = list(oos_ctx.symbols)
     else:
         symbols = get_symbols_from_online_features()
 
+    print("OOS_MODE:", oos_ctx.enabled)
+    print("OOS_SYMBOLS:", ",".join(oos_ctx.symbols))
+    print("OOS_START:", oos_ctx.start_text)
+    print("OOS_END:", oos_ctx.end_text)
     print("SYMBOLS:", len(symbols))
     print("DB_BATCH_LOAD: missing online_gate1_features rows")
     print()

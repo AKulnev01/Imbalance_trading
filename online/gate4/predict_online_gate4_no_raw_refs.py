@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from online.oos_context import append_oos_sql_filters, get_online_oos_context
+
 import numpy as np
 import pandas as pd
 import psycopg2
@@ -162,6 +164,7 @@ def make_signal_key(symbol: str, ts_value: pd.Timestamp) -> str:
 # LOAD ONLINE FEATURES
 # ============================================================
 
+
 def load_source_rows(conn, model_features: List[str]) -> pd.DataFrame:
     if not table_exists(conn, SOURCE_TABLE):
         raise RuntimeError("source table not found: {}".format(SOURCE_TABLE))
@@ -181,8 +184,7 @@ def load_source_rows(conn, model_features: List[str]) -> pd.DataFrame:
     missing_model_features = [c for c in model_features if c not in source_cols]
     if missing_model_features:
         raise RuntimeError(
-            "{}: missing model features: {} total={}".format(
-                SOURCE_TABLE,
+            "source table missing model features: {} total={}".format(
                 missing_model_features[:50],
                 len(missing_model_features),
             )
@@ -201,54 +203,74 @@ def load_source_rows(conn, model_features: List[str]) -> pd.DataFrame:
     if "upstream_is_oos" in source_cols:
         select_cols.append("upstream_is_oos")
 
-    select_cols.extend(model_features)
+    for c in model_features:
+        if c not in select_cols:
+            select_cols.append(c)
+
     select_cols = list(dict.fromkeys(select_cols))
+
+    def qident(value: str) -> str:
+        return '"' + str(value).replace('"', '""') + '"'
+
+    source_table = SOURCE_TABLE
+    target_table = TARGET_TABLE
 
     quoted_select_cols = ", ".join(['src."{}"'.format(c) for c in select_cols])
 
-    if "signal_key" in target_cols:
-        if signal_key_col is not None:
-            signal_key_expr = 'src."{}"'.format(signal_key_col)
-        else:
-            signal_key_expr = (
-                "src.symbol || '|' || "
-                "to_char(src.\"{}\" AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS+00:00') || "
-                "'|GATE4_NO_RAW_REFS'"
-            ).format(ts_col)
+    if signal_key_col is not None:
+        signal_key_expr = "src.{}".format(qident(signal_key_col))
+    else:
+        signal_key_expr = (
+            "UPPER(src.{symbol_col})"
+            " || '|' || "
+            "to_char(src.{ts_col} AT TIME ZONE 'UTC', 'YYYY-MM-DD\\\"T\\\"HH24:MI:SS\\\"+00:00\\\"')"
+            " || '|GATE4_NO_RAW_REFS'"
+        ).format(
+            symbol_col=qident("symbol"),
+            ts_col=qident(ts_col),
+        )
 
-        sql = """
+    where_parts = ["tgt.signal_key IS NULL"]
+    params: List[object] = []
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="src",
+        ts_column=qident(ts_col),
+        symbol_column=qident("symbol"),
+    )
+
+    where_sql = " AND ".join(where_parts)
+
+    sql = """
         SELECT
             {signal_key_expr} AS __signal_key,
             {quoted_select_cols}
         FROM {source_table} src
         LEFT JOIN {target_table} tgt
           ON tgt.signal_key = {signal_key_expr}
-        WHERE tgt.signal_key IS NULL
-        ORDER BY src."{ts_col}", src.symbol
+        WHERE {where_sql}
+        ORDER BY src.{ts_col}, src.symbol
         LIMIT {batch_limit}
-        """.format(
-            signal_key_expr=signal_key_expr,
-            quoted_select_cols=quoted_select_cols,
-            source_table=SOURCE_TABLE,
-            target_table=TARGET_TABLE,
-            ts_col=ts_col,
-            batch_limit=int(BATCH_LIMIT),
-        )
-    else:
-        sql = """
-        SELECT
-            {quoted_select_cols}
-        FROM {source_table} src
-        ORDER BY src."{ts_col}", src.symbol
-        LIMIT {batch_limit}
-        """.format(
-            quoted_select_cols=quoted_select_cols,
-            source_table=SOURCE_TABLE,
-            ts_col=ts_col,
-            batch_limit=int(BATCH_LIMIT),
-        )
+    """.format(
+        signal_key_expr=signal_key_expr,
+        quoted_select_cols=quoted_select_cols,
+        source_table=source_table,
+        target_table=target_table,
+        where_sql=where_sql,
+        ts_col=qident(ts_col),
+        batch_limit=int(BATCH_LIMIT),
+    )
 
-    df = pd.read_sql_query(sql, conn)
+    df = pd.read_sql_query(sql, conn, params=params)
+
+    if df.empty:
+        return df
+
+    if "__signal_key" in df.columns:
+        df["signal_key"] = df["__signal_key"].astype(str)
+        df = df.drop(columns=["__signal_key"])
 
     if ts_col in df.columns and ts_col != "ts":
         df = df.rename(columns={ts_col: "ts"})
@@ -263,28 +285,13 @@ def load_source_rows(conn, model_features: List[str]) -> pd.DataFrame:
     if bad_ts:
         raise RuntimeError("bad ts rows: {}".format(bad_ts))
 
-    if "signal_key" not in df.columns:
-        if "__signal_key" in df.columns:
-            df["signal_key"] = df["__signal_key"].astype(str)
-        else:
-            df["signal_key"] = [
-                make_signal_key(symbol=row_symbol, ts_value=row_ts)
-                for row_symbol, row_ts in zip(df["symbol"], df["ts"])
-            ]
-
     if "upstream_split" not in df.columns:
-        df["upstream_split"] = "online"
+        df["upstream_split"] = ""
 
     if "upstream_is_oos" not in df.columns:
-        df["upstream_is_oos"] = np.nan
+        df["upstream_is_oos"] = False
 
-    return df
-
-
-# ============================================================
-# PREPARE X EXACTLY FOR MODEL
-# ============================================================
-
+    return df.reset_index(drop=True)
 def prepare_x_from_online(
     df: pd.DataFrame,
     model_features: List[str],
@@ -527,8 +534,13 @@ def main() -> None:
         print("MODEL_PATH:", MODEL_PATH)
         print("FEATURES_CSV:", FEATURES_CSV)
         print("MEDIANS_JSON:", MEDIANS_JSON)
+        oos_ctx = get_online_oos_context()
         print("MODEL_FEATURE_COUNT:", len(model_feats))
         print("BATCH_LIMIT:", BATCH_LIMIT)
+        print("OOS_MODE:", oos_ctx.enabled)
+        print("OOS_SYMBOLS:", ",".join(oos_ctx.symbols))
+        print("OOS_START:", oos_ctx.start_text)
+        print("OOS_END:", oos_ctx.end_text)
         print()
 
         source_df = load_source_rows(conn, model_feats)
@@ -591,6 +603,23 @@ def main() -> None:
                     null_gate4_confidence
                 )
             )
+
+        # PROD_EMERGENCY_UPSTREAM_IS_OOS_NUMERIC_CAST:
+        # target online_gate4_predictions_no_raw_refs.upstream_is_oos is double precision.
+        # Convert bool/string flags to numeric before DB upsert.
+        if "upstream_is_oos" in pred_df.columns:
+            pred_df["upstream_is_oos"] = pd.to_numeric(
+                pred_df["upstream_is_oos"].replace({
+                    True: 1.0,
+                    False: 0.0,
+                    "True": 1.0,
+                    "False": 0.0,
+                    "true": 1.0,
+                    "false": 0.0,
+                    "": 0.0,
+                }),
+                errors="coerce",
+            ).fillna(0.0).astype(float)
 
         written = write_predictions(conn, pred_df)
 

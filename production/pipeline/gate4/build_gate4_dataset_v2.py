@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -38,6 +39,10 @@ DIR_MARGIN_ATR = 0.15
 DIR_FIRST_HIT_ATR = 0.35
 DIR_LABEL_MODE = "first_hit"
 UPSTREAM_VALID_TAIL_SHARE = 0.20
+
+TRAIN_END = os.environ.get("IMB_OFFLINE_TRAIN_END", "")
+VALID_START = os.environ.get("IMB_OFFLINE_VALID_START", "")
+VALID_END = os.environ.get("IMB_OFFLINE_VALID_END", "")
 
 GATE1_PROBA_MIN = 0.50
 
@@ -208,6 +213,147 @@ def load_json_safe(path: str) -> dict:
         return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
+
+
+def parse_optional_ts(value: str, name: str) -> Optional[pd.Timestamp]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    ts = pd.to_datetime(raw, utc=True, errors="coerce")
+    if pd.isna(ts):
+        raise SystemExit("bad {}: {}".format(name, value))
+
+    out = pd.Timestamp(ts)
+    if out.tzinfo is not None:
+        out = out.tz_convert("UTC").tz_localize(None)
+
+    return pd.Timestamp(out).floor("min")
+
+
+def parse_runtime_args():
+    parser = argparse.ArgumentParser(add_help=True)
+
+    parser.add_argument("--train-end", default=TRAIN_END)
+    parser.add_argument("--valid-start", default=VALID_START)
+    parser.add_argument("--valid-end", default=VALID_END)
+
+    args, _ = parser.parse_known_args()
+    return args
+
+
+def apply_runtime_args(args) -> None:
+    global TRAIN_END
+    global VALID_START
+    global VALID_END
+
+    TRAIN_END = str(args.train_end or "").strip()
+    VALID_START = str(args.valid_start or "").strip()
+    VALID_END = str(args.valid_end or "").strip()
+
+
+def refresh_output_paths() -> None:
+    global OUT_RAW_PARQUET
+    global OUT_DATASET_PARQUET
+    global OUT_AUDIT_CSV
+    global OUT_REPORT_JSON
+
+    OUT_RAW_PARQUET = os.path.join(OUT_ROOT, "gate4_1_candidates_raw.parquet")
+    OUT_DATASET_PARQUET = os.path.join(OUT_ROOT, "gate4_1_side_dataset.parquet")
+    OUT_AUDIT_CSV = os.path.join(OUT_ROOT, "_AUDIT.csv")
+    OUT_REPORT_JSON = os.path.join(OUT_ROOT, "_REPORT.json")
+
+
+def build_gate4_split_config() -> dict:
+    train_end = parse_optional_ts(TRAIN_END, "--train-end")
+    valid_start = parse_optional_ts(VALID_START, "--valid-start")
+    valid_end = parse_optional_ts(VALID_END, "--valid-end")
+
+    provided = [train_end is not None, valid_start is not None, valid_end is not None]
+
+    if any(provided) and not all(provided):
+        raise SystemExit(
+            "split args must be provided together: --train-end --valid-start --valid-end"
+        )
+
+    if train_end is None:
+        return {
+            "mode": "legacy_meta_or_tail",
+            "train_end": None,
+            "valid_start": None,
+            "valid_end": None,
+            "train_safe_cutoff": None,
+        }
+
+    if train_end > valid_start:
+        raise SystemExit(
+            "--train-end must be <= --valid-start, got train_end={} valid_start={}".format(
+                train_end,
+                valid_start,
+            )
+        )
+
+    if valid_start >= valid_end:
+        raise SystemExit(
+            "--valid-start must be < --valid-end, got valid_start={} valid_end={}".format(
+                valid_start,
+                valid_end,
+            )
+        )
+
+    train_safe_cutoff = train_end - pd.Timedelta(hours=4 * int(TTL_BARS))
+
+    return {
+        "mode": "fixed_time_train_safe",
+        "train_end": train_end,
+        "valid_start": valid_start,
+        "valid_end": valid_end,
+        "train_safe_cutoff": train_safe_cutoff,
+    }
+
+
+def apply_gate4_split(
+    df: pd.DataFrame,
+    split_config: dict,
+    legacy_valid_start_ts: Optional[pd.Timestamp],
+) -> pd.DataFrame:
+    out = df.copy()
+    out["ts"] = pd.to_datetime(out["ts"], errors="coerce")
+
+    if split_config.get("mode") == "fixed_time_train_safe":
+        train_end = pd.Timestamp(split_config["train_end"])
+        valid_start = pd.Timestamp(split_config["valid_start"])
+        valid_end = pd.Timestamp(split_config["valid_end"])
+        train_safe_cutoff = pd.Timestamp(split_config["train_safe_cutoff"])
+
+        train_mask = out["ts"] < train_safe_cutoff
+        valid_mask = (out["ts"] >= valid_start) & (out["ts"] < valid_end)
+
+        out["upstream_train_end_ts"] = train_end
+        out["upstream_train_safe_cutoff_ts"] = train_safe_cutoff
+        out["upstream_valid_start_ts"] = valid_start
+        out["upstream_valid_end_ts"] = valid_end
+        out["upstream_split"] = np.select(
+            [train_mask, valid_mask],
+            ["train", "valid"],
+            default="gap",
+        )
+        out["upstream_is_oos"] = (out["upstream_split"] == "valid").astype(int)
+        return out
+
+    out["upstream_train_end_ts"] = pd.NaT
+    out["upstream_train_safe_cutoff_ts"] = pd.NaT
+    out["upstream_valid_end_ts"] = pd.NaT
+    out["upstream_valid_start_ts"] = legacy_valid_start_ts
+
+    if legacy_valid_start_ts is not None:
+        out["upstream_split"] = np.where(out["ts"] >= legacy_valid_start_ts, "valid", "train")
+        out["upstream_is_oos"] = (out["ts"] >= legacy_valid_start_ts).astype(int)
+    else:
+        out["upstream_split"] = ""
+        out["upstream_is_oos"] = np.nan
+
+    return out
 
 def extract_gate3_meta_features(meta: dict, fallback_thr: float) -> dict:
     stats = meta.get("stats", {}) if isinstance(meta.get("stats", {}), dict) else {}
@@ -919,7 +1065,20 @@ def g3_short_meta_path(symbol: str) -> str:
 # ============================================================
 
 def main():
+    args = parse_runtime_args()
+    apply_runtime_args(args)
+    refresh_output_paths()
+    split_config = build_gate4_split_config()
+
     ensure_dir(OUT_ROOT)
+
+    print("Gate4 Dataset Builder")
+    print("OUT_ROOT:", OUT_ROOT)
+    print("TRAIN_END:", TRAIN_END)
+    print("VALID_START:", VALID_START)
+    print("VALID_END:", VALID_END)
+    print("SPLIT_CONFIG:", {k: str(v) for k, v in split_config.items()})
+    print("=" * 120)
 
     if not os.path.exists(POLICY_CSV):
         raise SystemExit(f"not found: {POLICY_CSV}")
@@ -969,6 +1128,11 @@ def main():
             "rows_after_merge": 0,
             "rows_raw_candidates": 0,
             "rows_labeled": 0,
+            "split_mode": str(split_config.get("mode")),
+            "train_end": "" if split_config.get("train_end") is None else str(split_config.get("train_end")),
+            "train_safe_cutoff": "" if split_config.get("train_safe_cutoff") is None else str(split_config.get("train_safe_cutoff")),
+            "valid_start": "" if split_config.get("valid_start") is None else str(split_config.get("valid_start")),
+            "valid_end": "" if split_config.get("valid_end") is None else str(split_config.get("valid_end")),
             "status": "init",
         }
 
@@ -1522,7 +1686,7 @@ def main():
             deltas=ALL_DELTAS,
         )
 
-        valid_start_ts = resolve_validation_start_ts(
+        legacy_valid_start_ts = resolve_validation_start_ts(
             ts_series=work["ts"],
             meta_paths=[
                 gate1_meta_path(symbol),
@@ -1534,13 +1698,11 @@ def main():
             fallback_tail_share=UPSTREAM_VALID_TAIL_SHARE,
         )
 
-        work["upstream_valid_start_ts"] = valid_start_ts
-        if valid_start_ts is not None:
-            work["upstream_split"] = np.where(work["ts"] >= valid_start_ts, "valid", "train")
-            work["upstream_is_oos"] = (work["ts"] >= valid_start_ts).astype(int)
-        else:
-            work["upstream_split"] = ""
-            work["upstream_is_oos"] = np.nan
+        work = apply_gate4_split(
+            df=work,
+            split_config=split_config,
+            legacy_valid_start_ts=legacy_valid_start_ts,
+        )
 
         gate4_keep_cols = [
             "ts",
@@ -1693,7 +1855,10 @@ def main():
             "is_short_delta_075",
             "is_ambig_delta_075",
 
+            "upstream_train_end_ts",
+            "upstream_train_safe_cutoff_ts",
             "upstream_valid_start_ts",
+            "upstream_valid_end_ts",
             "upstream_split",
             "upstream_is_oos",
         ]
@@ -1704,6 +1869,9 @@ def main():
         cand_raw = work[work["pass_any"] == 1].copy()
 
         audit["rows_raw_candidates"] = int(len(cand_raw))
+        audit["train_rows"] = int((work["upstream_split"] == "train").sum()) if "upstream_split" in work.columns else 0
+        audit["valid_rows"] = int((work["upstream_split"] == "valid").sum()) if "upstream_split" in work.columns else 0
+        audit["gap_rows"] = int((work["upstream_split"] == "gap").sum()) if "upstream_split" in work.columns else 0
 
         if len(cand_raw) == 0:
             audit["status"] = "no_candidates"
@@ -1754,7 +1922,16 @@ def main():
         "g3_score_extreme_min": float(G3_SCORE_EXTREME_MIN),
         "require_gate1_pass": bool(REQUIRE_GATE1_PASS),
         "gate3_bundle_logic": "independent_per_side",
-                "base_context_cols_count": int(len(BASE_CONTEXT_COLS)),
+        "split": {
+            "mode": str(split_config.get("mode")),
+            "train_end": "" if split_config.get("train_end") is None else str(split_config.get("train_end")),
+            "train_safe_cutoff": "" if split_config.get("train_safe_cutoff") is None else str(split_config.get("train_safe_cutoff")),
+            "valid_start": "" if split_config.get("valid_start") is None else str(split_config.get("valid_start")),
+            "valid_end": "" if split_config.get("valid_end") is None else str(split_config.get("valid_end")),
+            "train_rule": "ts < train_end - TTL_BARS * 4h" if split_config.get("mode") == "fixed_time_train_safe" else "legacy meta/fallback split",
+            "valid_rule": "valid_start <= ts < valid_end" if split_config.get("mode") == "fixed_time_train_safe" else "ts >= upstream_valid_start_ts",
+        },
+        "base_context_cols_count": int(len(BASE_CONTEXT_COLS)),
         "primary_target": "y_side_clean_delta_050",
         "aux_target_columns": [
             "y_side_clean_delta_060",

@@ -1,6 +1,7 @@
 import os
 import json
-from typing import Optional
+import argparse
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -12,17 +13,17 @@ from scipy.stats import binomtest
 
 #python production/pipeline/train_gate3_score.py
 
-H4_DIR = "data/h4_3"
-BASE_DATA_DIR = "production/dataset/gate1"
+H4_DIR = os.environ.get("IMB_GATE3_H4_DIR", "data/h4_3")
+BASE_DATA_DIR = os.environ.get("IMB_GATE3_BASE_DATA_DIR", "production/dataset/gate1")
 
-GATE3_DATA_DIR = "production/dataset/pa_gate3_v3_long_short_by_symbol"
-GATE3_AUDIT_CSV = "production/dataset/_AUDIT_GATE3_PA_V3_LONG_SHORT.csv"
+GATE3_DATA_DIR = os.environ.get("IMB_GATE3_DATA_DIR", "production/dataset/pa_gate3_v3_long_short_by_symbol")
+GATE3_AUDIT_CSV = os.environ.get("IMB_GATE3_AUDIT_CSV", "production/dataset/_AUDIT_GATE3_PA_V3_LONG_SHORT.csv")
 
-GATE1_MODELS_DIR = "production/models/final_gate1"
+GATE1_MODELS_DIR = os.environ.get("IMB_GATE3_GATE1_MODELS_DIR", "production/models/final_gate1")
 
-POLICY_CSV = "production/models/ks/gate3_symbol_policy.csv"
+POLICY_CSV = os.environ.get("IMB_GATE3_POLICY_CSV", "production/models/ks/gate3_symbol_policy.csv")
 
-OUT_ROOT = "production/models/final_gate3_score_long_short"
+OUT_ROOT = os.environ.get("IMB_GATE3_OUT_ROOT", "production/models/final_gate3_score_long_short")
 OUT_MANIFEST_CSV = os.path.join(OUT_ROOT, "_MANIFEST.csv")
 OUT_REPORT_JSON = os.path.join(OUT_ROOT, "_REPORT.json")
 OUT_AUDIT_CSV = os.path.join(OUT_ROOT, "_AUDIT_TRAINSETS.csv")
@@ -79,6 +80,216 @@ CB_PARAMS = {
 # ============================================================
 # HELPERS
 # ============================================================
+
+SPLIT_ENV_TRAIN_END = "IMB_OFFLINE_TRAIN_END"
+SPLIT_ENV_VALID_START = "IMB_OFFLINE_VALID_START"
+SPLIT_ENV_VALID_END = "IMB_OFFLINE_VALID_END"
+SPLIT_ENV_SYMBOLS = "IMB_OFFLINE_SYMBOLS"
+
+
+def parse_optional_split_ts(raw: Optional[str], name: str) -> Optional[pd.Timestamp]:
+    text = str(raw or "").strip()
+
+    if not text:
+        return None
+
+    ts = pd.to_datetime(text, utc=True, errors="coerce")
+
+    if pd.isna(ts):
+        raise SystemExit("bad {} value: {}".format(name, raw))
+
+    out = pd.Timestamp(ts)
+
+    if out.tzinfo is not None:
+        out = out.tz_convert("UTC").tz_localize(None)
+
+    return pd.Timestamp(out).floor("min")
+
+
+def parse_symbol_filter(raw: Optional[str]) -> Optional[set[str]]:
+    text = str(raw or "").strip()
+
+    if not text:
+        return None
+
+    out = set()
+
+    for part in text.replace(";", ",").replace(" ", ",").split(","):
+        symbol = part.strip().upper()
+
+        if not symbol:
+            continue
+
+        if not symbol.endswith("USDT"):
+            symbol = symbol + "USDT"
+
+        out.add(symbol)
+
+    return out if out else None
+
+
+def parse_gate3_split_args() -> dict:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--train-end", default="")
+    parser.add_argument("--valid-start", default="")
+    parser.add_argument("--valid-end", default="")
+    parser.add_argument("--symbols", default="")
+    args, _ = parser.parse_known_args()
+
+    train_end = parse_optional_split_ts(
+        args.train_end or os.environ.get(SPLIT_ENV_TRAIN_END, ""),
+        "--train-end",
+    )
+    valid_start = parse_optional_split_ts(
+        args.valid_start or os.environ.get(SPLIT_ENV_VALID_START, ""),
+        "--valid-start",
+    )
+    valid_end = parse_optional_split_ts(
+        args.valid_end or os.environ.get(SPLIT_ENV_VALID_END, ""),
+        "--valid-end",
+    )
+
+    symbols = parse_symbol_filter(
+        args.symbols or os.environ.get(SPLIT_ENV_SYMBOLS, "")
+    )
+
+    provided = [train_end is not None, valid_start is not None, valid_end is not None]
+
+    if any(provided) and not all(provided):
+        raise SystemExit(
+            "split args must be provided together: --train-end --valid-start --valid-end"
+        )
+
+    if train_end is None:
+        return {
+            "mode": "legacy_tail_share",
+            "train_end": None,
+            "valid_start": None,
+            "valid_end": None,
+            "symbols": symbols,
+            "valid_share": float(VALID_SHARE),
+        }
+
+    if train_end > valid_start:
+        raise SystemExit(
+            "--train-end must be <= --valid-start, got train_end={} valid_start={}".format(
+                train_end,
+                valid_start,
+            )
+        )
+
+    if valid_start >= valid_end:
+        raise SystemExit(
+            "--valid-start must be < --valid-end, got valid_start={} valid_end={}".format(
+                valid_start,
+                valid_end,
+            )
+        )
+
+    return {
+        "mode": "fixed_time",
+        "train_end": train_end,
+        "valid_start": valid_start,
+        "valid_end": valid_end,
+        "symbols": symbols,
+        "valid_share": None,
+    }
+
+
+def gate3_split_config_for_json(split_config: dict) -> dict:
+    symbols = split_config.get("symbols")
+
+    return {
+        "mode": str(split_config.get("mode") or ""),
+        "train_end": None if split_config.get("train_end") is None else str(split_config.get("train_end")),
+        "valid_start": None if split_config.get("valid_start") is None else str(split_config.get("valid_start")),
+        "valid_end": None if split_config.get("valid_end") is None else str(split_config.get("valid_end")),
+        "symbols": None if symbols is None else sorted(list(symbols)),
+        "valid_share": split_config.get("valid_share"),
+    }
+
+
+def split_gate3_train_valid(candidates: pd.DataFrame, split_config: dict) -> dict:
+    x = candidates.copy()
+    x["ts"] = pd.to_datetime(x["ts"], errors="coerce")
+    x = x.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+
+    mode = str(split_config.get("mode") or "legacy_tail_share")
+
+    if mode == "fixed_time":
+        train_end = pd.Timestamp(split_config["train_end"])
+        valid_start = pd.Timestamp(split_config["valid_start"])
+        valid_end = pd.Timestamp(split_config["valid_end"])
+
+        gap_bars = int(TTL_BARS) + 1
+        gap_delta = pd.Timedelta(hours=4 * gap_bars)
+        train_cutoff = train_end - gap_delta
+
+        train_df = x[x["ts"] < train_cutoff].copy()
+        valid_df = x[(x["ts"] >= valid_start) & (x["ts"] < valid_end)].copy()
+
+        return {
+            "split_source": "fixed_time",
+            "rows_total": int(len(x)),
+            "rows_train": int(len(train_df)),
+            "rows_valid": int(len(valid_df)),
+            "train_df": train_df,
+            "valid_df": valid_df,
+            "gap_bars": int(gap_bars),
+            "gap_delta_hours": float(gap_delta.total_seconds() / 3600.0),
+            "train_end": str(train_end),
+            "valid_start": str(valid_start),
+            "valid_end": str(valid_end),
+            "train_cutoff": str(train_cutoff),
+            "train_min_ts": None if train_df.empty else str(train_df["ts"].min()),
+            "train_max_ts": None if train_df.empty else str(train_df["ts"].max()),
+            "valid_min_ts": None if valid_df.empty else str(valid_df["ts"].min()),
+            "valid_max_ts": None if valid_df.empty else str(valid_df["ts"].max()),
+            "train_condition": "ts < train_end - gap_delta",
+            "valid_condition": "valid_start <= ts < valid_end",
+        }
+
+    n_total = len(x)
+    n_valid_plan = max(MIN_VALID_ROWS, int(round(n_total * VALID_SHARE)))
+    n_valid_plan = min(n_valid_plan, max(0, n_total - MIN_TRAIN_ROWS))
+    n_train_plan = n_total - n_valid_plan
+
+    if n_train_plan < MIN_TRAIN_ROWS and n_total >= (MIN_TRAIN_ROWS + MIN_VALID_ROWS):
+        n_train_plan = MIN_TRAIN_ROWS
+        n_valid_plan = n_total - n_train_plan
+
+    gap_bars = int(TTL_BARS) + 1
+
+    train_df = x.iloc[:max(0, n_train_plan - gap_bars)].copy()
+    valid_df = x.iloc[n_train_plan:].copy()
+
+    split_ts = None
+    if len(valid_df):
+        split_ts = valid_df["ts"].min()
+
+    return {
+        "split_source": "legacy_tail_share",
+        "rows_total": int(len(x)),
+        "rows_train": int(len(train_df)),
+        "rows_valid": int(len(valid_df)),
+        "train_df": train_df,
+        "valid_df": valid_df,
+        "gap_bars": int(gap_bars),
+        "gap_delta_hours": float(4 * gap_bars),
+        "train_end": None if split_ts is None else str(split_ts),
+        "valid_start": None if split_ts is None else str(split_ts),
+        "valid_end": None,
+        "train_cutoff": None,
+        "train_min_ts": None if train_df.empty else str(train_df["ts"].min()),
+        "train_max_ts": None if train_df.empty else str(train_df["ts"].max()),
+        "valid_min_ts": None if valid_df.empty else str(valid_df["ts"].min()),
+        "valid_max_ts": None if valid_df.empty else str(valid_df["ts"].max()),
+        "train_condition": "legacy: candidates.iloc[:n_train - gap]",
+        "valid_condition": "legacy: candidates.iloc[n_train:]",
+    }
+
+
+
 def normalize_side_name(side: str) -> str:
     side = str(side).strip().lower()
     if side not in {"long", "short"}:
@@ -112,19 +323,30 @@ def select_side_pattern_cols(cols: list[str], side: str) -> list[str]:
     return sorted(set(out))
 
 
-def load_quality_map(quality_csv: str) -> dict[str, float]:
-    if not os.path.exists(quality_csv):
-        raise SystemExit(f"not found: {quality_csv}")
+def load_quality_map(path: str) -> Dict[str, float]:
+    if not path:
+        return {}
 
-    q = pd.read_csv(quality_csv)
-    if "symbol" not in q.columns or "pa_valid_rate" not in q.columns:
-        raise SystemExit(f"quality csv must contain symbol, pa_valid_rate: {quality_csv}")
+    if not os.path.exists(path):
+        return {}
 
-    q["symbol"] = q["symbol"].astype(str)
-    q["pa_valid_rate"] = pd.to_numeric(q["pa_valid_rate"], errors="coerce")
+    df = pd.read_csv(path)
 
-    q = q.dropna(subset=["symbol", "pa_valid_rate"]).copy()
-    return dict(zip(q["symbol"], q["pa_valid_rate"]))
+    if "symbol" not in df.columns or "pa_valid_rate" not in df.columns:
+        print(
+            "GATE3_QUALITY_CSV_SKIP_BAD_FORMAT: {} | columns={}".format(
+                path,
+                sorted(list(df.columns)),
+            )
+        )
+        return {}
+
+    df["symbol"] = df["symbol"].astype(str).str.upper()
+    df["pa_valid_rate"] = pd.to_numeric(df["pa_valid_rate"], errors="coerce")
+    df = df.dropna(subset=["symbol", "pa_valid_rate"])
+
+    return dict(zip(df["symbol"], df["pa_valid_rate"]))
+
 
 def ensure_dt_utc(s):
     return pd.to_datetime(s, utc=True, errors="coerce")
@@ -575,6 +797,13 @@ def threshold_search(valid_df: pd.DataFrame, prob_col: str = "proba", edge_col: 
 # MAIN
 # ============================================================
 
+GATE3_SPLIT_CONFIG = parse_gate3_split_args()
+
+print("=" * 120)
+print("GATE3_SCORE_SPLIT_CONFIG")
+print(json.dumps(gate3_split_config_for_json(GATE3_SPLIT_CONFIG), ensure_ascii=False, indent=2))
+print("=" * 120)
+
 os.makedirs(OUT_ROOT, exist_ok=True)
 
 if not os.path.exists(POLICY_CSV):
@@ -582,6 +811,84 @@ if not os.path.exists(POLICY_CSV):
 
 policy = pd.read_csv(POLICY_CSV)
 policy["symbol"] = policy["symbol"].astype(str)
+
+if GATE3_SPLIT_CONFIG.get("symbols") is not None:
+    before_policy_rows = len(policy)
+    requested_symbols = sorted([str(x).upper() for x in GATE3_SPLIT_CONFIG["symbols"]])
+    policy = policy[policy["symbol"].astype(str).str.upper().isin(requested_symbols)].copy()
+    print("SYMBOL_FILTER:", requested_symbols)
+    print("POLICY_ROWS_BEFORE_FILTER:", before_policy_rows)
+    print("POLICY_ROWS_AFTER_FILTER:", len(policy))
+
+    if len(policy) == 0:
+        print("GATE3_EMPTY_POLICY_FALLBACK_ENABLED")
+        print("GATE3_EMPTY_POLICY_FALLBACK_SYMBOLS:", requested_symbols)
+
+        fallback_rows = []
+
+        for symbol in requested_symbols:
+            row = {col: "" for col in policy.columns}
+            row["symbol"] = symbol
+
+            for col in [
+                "gate3_enabled",
+                "gate3_enabled_long",
+                "gate3_enabled_short",
+                "gate3_use_score_model_long",
+                "gate3_use_score_model_short",
+            ]:
+                if col in row:
+                    row[col] = 0
+
+            for col in [
+                "gate3_score_long",
+                "gate3_score_short",
+                "gate3_score_long_z",
+                "gate3_score_short_z",
+                "gate3_rank_long",
+                "gate3_rank_short",
+                "gate3_top_pattern_long",
+                "gate3_top_pattern_short",
+                "gate3_side_bias",
+                "gate3_score_threshold_long",
+                "gate3_score_threshold_short",
+            ]:
+                if col in row:
+                    row[col] = 0.0
+
+            for col in list(row.keys()):
+                if str(col).startswith("active_pa_"):
+                    row[col] = 0.0
+
+            if "gate3_mode_long" in row:
+                row["gate3_mode_long"] = "disabled"
+
+            if "gate3_mode_short" in row:
+                row["gate3_mode_short"] = "disabled"
+
+            if "reason_long" in row:
+                row["reason_long"] = "no_active_edge_for_symbol"
+
+            if "reason_short" in row:
+                row["reason_short"] = "no_active_edge_for_symbol"
+
+            if "gate3_pattern_long" in row:
+                row["gate3_pattern_long"] = ""
+
+            if "gate3_pattern_short" in row:
+                row["gate3_pattern_short"] = ""
+
+            if "gate3_score_model_name_long" in row:
+                row["gate3_score_model_name_long"] = ""
+
+            if "gate3_score_model_name_short" in row:
+                row["gate3_score_model_name_short"] = ""
+
+            fallback_rows.append(row)
+
+        policy = pd.DataFrame(fallback_rows, columns=list(policy.columns))
+        print("GATE3_EMPTY_POLICY_FALLBACK_ROWS:", len(policy))
+
 
 for col in [
     "gate3_enabled",
@@ -620,18 +927,29 @@ quality_map = load_quality_map(GATE3_AUDIT_CSV) if os.path.exists(GATE3_AUDIT_CS
 
 if os.path.exists(GATE3_AUDIT_CSV):
     gate3_audit_df = pd.read_csv(GATE3_AUDIT_CSV)
+
     if "symbol" not in gate3_audit_df.columns or "pa_valid_rate" not in gate3_audit_df.columns:
-        raise SystemExit(f"bad audit format: {GATE3_AUDIT_CSV}")
+        print(
+            "GATE3_QUALITY_CSV_SKIP_BAD_FORMAT: {} | columns={}".format(
+                GATE3_AUDIT_CSV,
+                sorted(list(gate3_audit_df.columns)),
+            )
+        )
+        gate3_audit_df = pd.DataFrame(columns=["symbol", "pa_valid_rate"])
+        good_symbols_by_quality = set(gate3_available_symbols)
+    else:
+        gate3_audit_df["symbol"] = gate3_audit_df["symbol"].astype(str)
+        gate3_audit_df["pa_valid_rate"] = pd.to_numeric(
+            gate3_audit_df["pa_valid_rate"],
+            errors="coerce",
+        )
 
-    gate3_audit_df["symbol"] = gate3_audit_df["symbol"].astype(str)
-    gate3_audit_df["pa_valid_rate"] = pd.to_numeric(gate3_audit_df["pa_valid_rate"], errors="coerce")
-
-    good_symbols_by_quality = set(
-        gate3_audit_df.loc[
-            gate3_audit_df["pa_valid_rate"] >= MIN_SYMBOL_PA_VALID_RATE,
-            "symbol"
-        ].tolist()
-    )
+        good_symbols_by_quality = set(
+            gate3_audit_df.loc[
+                gate3_audit_df["pa_valid_rate"] >= MIN_SYMBOL_PA_VALID_RATE,
+                "symbol"
+            ].tolist()
+        )
 else:
     gate3_audit_df = None
     good_symbols_by_quality = set(gate3_available_symbols)
@@ -663,7 +981,7 @@ for _, prow in policy.iterrows():
         })
         continue
 
-    quality_valid_rate = quality_map.get(symbol, np.nan) if quality_map else np.nan
+    quality_valid_rate = quality_map.get(symbol, np.nan) if quality_map else 1.0
     if not np.isfinite(quality_valid_rate):
         for side in SIDES:
             audit_rows.append({
@@ -1046,14 +1364,15 @@ for _, prow in policy.iterrows():
 
         candidates = candidates.sort_values("ts").reset_index(drop=True)
 
-        n_total = len(candidates)
-        n_valid = max(MIN_VALID_ROWS, int(round(n_total * VALID_SHARE)))
-        n_valid = min(n_valid, max(0, n_total - MIN_TRAIN_ROWS))
-        n_train = n_total - n_valid
+        split_info = split_gate3_train_valid(candidates, GATE3_SPLIT_CONFIG)
 
-        if n_train < MIN_TRAIN_ROWS and n_total >= (MIN_TRAIN_ROWS + MIN_VALID_ROWS):
-            n_train = MIN_TRAIN_ROWS
-            n_valid = n_total - n_train
+        n_total = int(split_info["rows_total"])
+        n_train = int(split_info["rows_train"])
+        n_valid = int(split_info["rows_valid"])
+        split_source = str(split_info["split_source"])
+
+        train_df = split_info["train_df"]
+        valid_df = split_info["valid_df"]
 
         if n_total < MIN_ROWS_TOTAL or n_train < MIN_TRAIN_ROWS or n_valid < MIN_VALID_ROWS:
             audit_rows.append({
@@ -1064,14 +1383,14 @@ for _, prow in policy.iterrows():
                 "rows_total": int(n_total),
                 "rows_train": int(n_train),
                 "rows_valid": int(n_valid),
+                "split_source": split_source,
+                "train_min_ts": split_info.get("train_min_ts"),
+                "train_max_ts": split_info.get("train_max_ts"),
+                "valid_min_ts": split_info.get("valid_min_ts"),
+                "valid_max_ts": split_info.get("valid_max_ts"),
                 "status": "too_few_rows",
             })
             continue
-
-        GAP = TTL_BARS + 1
-
-        train_df = candidates.iloc[:n_train - GAP]
-        valid_df = candidates.iloc[n_train:]
         if train_df["y_edge"].nunique() < 2 or valid_df["y_edge"].nunique() < 2:
             audit_rows.append({
                 "symbol": symbol,
@@ -1301,6 +1620,21 @@ for _, prow in policy.iterrows():
             "rows_total": int(n_total),
             "rows_train": int(n_train),
             "rows_valid": int(n_valid),
+            "split": {
+                "type": split_source,
+                "train_end": split_info.get("train_end"),
+                "valid_start_ts": split_info.get("valid_start"),
+                "valid_end_ts": split_info.get("valid_end"),
+                "train_cutoff": split_info.get("train_cutoff"),
+                "gap_bars": split_info.get("gap_bars"),
+                "gap_delta_hours": split_info.get("gap_delta_hours"),
+                "train_condition": split_info.get("train_condition"),
+                "valid_condition": split_info.get("valid_condition"),
+                "train_min_ts": split_info.get("train_min_ts"),
+                "train_max_ts": split_info.get("train_max_ts"),
+                "valid_min_ts": split_info.get("valid_min_ts"),
+                "valid_max_ts": split_info.get("valid_max_ts"),
+            },
             "feature_count": int(len(feature_cols)),
             "feature_names": feature_cols,
             "quality_valid_rate": float(quality_valid_rate),
@@ -1373,6 +1707,14 @@ for _, prow in policy.iterrows():
             "rows_total": int(n_total),
             "rows_train": int(n_train),
             "rows_valid": int(n_valid),
+            "split_source": split_source,
+            "train_end": split_info.get("train_end"),
+            "valid_start_ts": split_info.get("valid_start"),
+            "valid_end_ts": split_info.get("valid_end"),
+            "train_min_ts": split_info.get("train_min_ts"),
+            "train_max_ts": split_info.get("train_max_ts"),
+            "valid_min_ts": split_info.get("valid_min_ts"),
+            "valid_max_ts": split_info.get("valid_max_ts"),
             "valid_pos_rate": float(y_valid.mean()),
             "thr_kept_n": int(best_thr["kept_n"]),
             "thr_kept_pos_rate": float(best_thr["kept_pos_rate"]),
@@ -1397,6 +1739,14 @@ for _, prow in policy.iterrows():
             "rows_total": int(n_total),
             "rows_train": int(n_train),
             "rows_valid": int(n_valid),
+            "split_source": split_source,
+            "train_end": split_info.get("train_end"),
+            "valid_start_ts": split_info.get("valid_start"),
+            "valid_end_ts": split_info.get("valid_end"),
+            "train_min_ts": split_info.get("train_min_ts"),
+            "train_max_ts": split_info.get("train_max_ts"),
+            "valid_min_ts": split_info.get("valid_min_ts"),
+            "valid_max_ts": split_info.get("valid_max_ts"),
             "status": "ok",
         })
 
@@ -1410,6 +1760,15 @@ if len(manifest_df):
     ).reset_index(drop=True)
 
 if len(audit_df):
+    for col, default_value in [
+        ("status", ""),
+        ("side", ""),
+        ("rows_total", 0),
+        ("symbol", ""),
+    ]:
+        if col not in audit_df.columns:
+            audit_df[col] = default_value
+
     audit_df = audit_df.sort_values(
         ["status", "side", "rows_total", "symbol"],
         ascending=[True, True, False, True]
@@ -1431,6 +1790,7 @@ report = {
     "training_mode": "multi_active_patterns_full_sequence_long_short",
     "quality_min_valid_rate": float(MIN_SYMBOL_PA_VALID_RATE),
     "sides": list(SIDES),
+    "split_config": gate3_split_config_for_json(GATE3_SPLIT_CONFIG),
 }
 
 with open(OUT_REPORT_JSON, "w", encoding="utf-8") as f:

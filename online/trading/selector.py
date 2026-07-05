@@ -61,6 +61,8 @@ def ensure_trading_signal_extra_columns() -> None:
             ADD COLUMN IF NOT EXISTS h4_close DOUBLE PRECISION,
             ADD COLUMN IF NOT EXISTS atr14 DOUBLE PRECISION,
             ADD COLUMN IF NOT EXISTS signal_strength DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS gate2_side_margin DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS admission_source TEXT,
             ADD COLUMN IF NOT EXISTS dynamic_symbol_allowed BOOLEAN,
             ADD COLUMN IF NOT EXISTS dynamic_symbol_reason TEXT,
             ADD COLUMN IF NOT EXISTS skipped_reason TEXT,
@@ -111,11 +113,18 @@ def get_gate2_join_sql() -> Tuple[str, str]:
 
     if "up_reach_high_proba" in cols and "dn_reach_high_proba" in cols:
         select_sql = """
+        g2.up_reach_high_proba AS gate2_up_reach_high_proba,
+        g2.dn_reach_high_proba AS gate2_dn_reach_high_proba,
         CASE
             WHEN UPPER(g51.side) = 'LONG' THEN g2.up_reach_high_proba
             WHEN UPPER(g51.side) = 'SHORT' THEN g2.dn_reach_high_proba
             ELSE NULL
-        END AS gate2_for_side_proba
+        END AS gate2_for_side_proba,
+        CASE
+            WHEN UPPER(g51.side) = 'LONG' THEN g2.up_reach_high_proba - g2.dn_reach_high_proba
+            WHEN UPPER(g51.side) = 'SHORT' THEN g2.dn_reach_high_proba - g2.up_reach_high_proba
+            ELSE NULL
+        END AS gate2_side_margin
         """
         return join_sql, select_sql
 
@@ -132,7 +141,12 @@ def get_gate2_join_sql() -> Tuple[str, str]:
         required=True,
     )
 
-    select_sql = "g2.{proba_col} AS gate2_for_side_proba".format(proba_col=proba_col)
+    select_sql = """
+    NULL::DOUBLE PRECISION AS gate2_up_reach_high_proba,
+    NULL::DOUBLE PRECISION AS gate2_dn_reach_high_proba,
+    g2.{proba_col} AS gate2_for_side_proba,
+    NULL::DOUBLE PRECISION AS gate2_side_margin
+    """.format(proba_col=proba_col)
 
     return join_sql, select_sql
 
@@ -265,7 +279,10 @@ def normalize_candidates(df: pd.DataFrame) -> pd.DataFrame:
     for c in [
         "h4_close",
         "atr14",
+        "gate2_up_reach_high_proba",
+        "gate2_dn_reach_high_proba",
         "gate2_for_side_proba",
+        "gate2_side_margin",
         "gate4_confidence",
         "gate5_1_proba",
         "gate5_3_proba",
@@ -337,6 +354,47 @@ def threshold_reject_reason(row: pd.Series) -> Optional[str]:
 
     return None
 
+def get_conditional_side_rule(symbol: str, side: str) -> Optional[Dict[str, object]]:
+    rules = getattr(config, "CONDITIONAL_SIDE_AWARE_WHITELIST", {}) or {}
+    symbol_rules = rules.get(str(symbol).upper())
+
+    if not isinstance(symbol_rules, dict):
+        return None
+
+    side_rule = symbol_rules.get(str(side).upper())
+
+    if not isinstance(side_rule, dict):
+        return None
+
+    return side_rule
+
+def get_side_admission_result(row: pd.Series) -> Tuple[bool, Optional[str], Optional[str]]:
+    symbol = str(row.get("symbol") or "").upper()
+    side = str(row.get("side") or "").upper()
+
+    side_rules = getattr(config, "SIDE_AWARE_WHITELIST", {}) or {}
+
+    if side_rules and config.is_allowed_by_side_rules(symbol, side, side_rules):
+        return True, "CURRENT_WHITELIST", None
+
+    if not bool(getattr(config, "CONDITIONAL_SIDE_AWARE_WHITELIST_ENABLED", True)):
+        return False, None, "NO_WHITELIST"
+
+    conditional_rule = get_conditional_side_rule(symbol, side)
+
+    if conditional_rule is None:
+        return False, None, "NO_WHITELIST"
+
+    min_margin = float(conditional_rule.get("min_gate2_side_margin", 0.0) or 0.0)
+    margin = row.get("gate2_side_margin")
+
+    if pd.isna(margin):
+        return False, None, "MISSING_GATE2_SIDE_MARGIN"
+
+    if float(margin) < min_margin:
+        return False, None, "BELOW_CONDITIONAL_GATE2_MARGIN"
+
+    return True, "CONDITIONAL_WHITELIST", None
 
 def apply_prod_thresholds_with_reasons(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -356,8 +414,30 @@ def apply_prod_thresholds_with_reasons(df: pd.DataFrame) -> pd.DataFrame:
         excluded = set(str(x).upper() for x in config.FORCED_EXCLUDED_SYMBOLS)
         out.loc[out["symbol"].isin(excluded), "threshold_reject_reason"] = "FORCED_EXCLUDED_SYMBOL"
 
-    return out.reset_index(drop=True)
+    side_rules = getattr(config, "SIDE_AWARE_WHITELIST", {}) or {}
+    conditional_side_rules = (
+        getattr(config, "CONDITIONAL_SIDE_AWARE_WHITELIST", {}) or {}
+        if bool(getattr(config, "CONDITIONAL_SIDE_AWARE_WHITELIST_ENABLED", True))
+        else {}
+    )
 
+    out["admission_source"] = None
+
+    if side_rules or conditional_side_rules:
+        for idx, row in out.iterrows():
+            current_reason = row.get("threshold_reject_reason")
+
+            if current_reason is not None and not pd.isna(current_reason):
+                continue
+
+            allowed, admission_source, reject_reason = get_side_admission_result(row)
+
+            if allowed:
+                out.at[idx, "admission_source"] = admission_source
+            else:
+                out.at[idx, "threshold_reject_reason"] = reject_reason
+
+    return out.reset_index(drop=True)
 
 def passed_thresholds(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -429,6 +509,8 @@ def save_signal_row(
             gate5_1_proba,
             gate5_3_proba,
             signal_strength,
+            gate2_side_margin,
+            admission_source,
 
             selected,
             rejected,
@@ -444,7 +526,7 @@ def save_signal_row(
             %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s,
             %s, %s,
-            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, %s, %s, NOW()
         )
         ON CONFLICT (signal_key)
@@ -466,6 +548,8 @@ def save_signal_row(
             gate5_1_proba = EXCLUDED.gate5_1_proba,
             gate5_3_proba = EXCLUDED.gate5_3_proba,
             signal_strength = EXCLUDED.signal_strength,
+            gate2_side_margin = EXCLUDED.gate2_side_margin,
+            admission_source = EXCLUDED.admission_source,
 
             selected = EXCLUDED.selected,
             rejected = EXCLUDED.rejected,
@@ -499,6 +583,8 @@ def save_signal_row(
         float(signal.get("gate5_1_proba")) if pd.notna(signal.get("gate5_1_proba")) else None,
         float(signal.get("gate5_3_proba")) if pd.notna(signal.get("gate5_3_proba")) else None,
         float(signal.get("signal_strength")) if pd.notna(signal.get("signal_strength")) else None,
+        float(signal.get("gate2_side_margin")) if pd.notna(signal.get("gate2_side_margin")) else None,
+        str(signal.get("admission_source")) if signal.get("admission_source") is not None and pd.notna(signal.get("admission_source")) else None,
 
         bool(selected),
         bool(rejected),
@@ -514,7 +600,11 @@ def save_signal_row(
         cur.execute(sql, params)
 
 
-def save_selection_snapshot(df: pd.DataFrame, best_signal_key: Optional[str]) -> None:
+def save_selection_snapshot(
+    df: pd.DataFrame,
+    best_signal_key: Optional[str],
+    entry_block_reason: Optional[str] = None,
+) -> None:
     if df.empty:
         return
 
@@ -556,6 +646,9 @@ def save_selection_snapshot(df: pd.DataFrame, best_signal_key: Optional[str]) ->
             elif dynamic_allowed is False:
                 reject_reason = "DYNAMIC_BLACKLIST"
                 skipped_reason = dynamic_reason
+            elif entry_block_reason:
+                reject_reason = str(entry_block_reason)
+                skipped_reason = str(entry_block_reason)
             else:
                 reject_reason = "SLOT1_LOST_TO_STRONGER_SIGNAL"
 
@@ -618,11 +711,25 @@ def threshold_reject_reason_verbose(row: pd.Series) -> str:
     if side not in ["LONG", "SHORT"]:
         reasons.append("BAD_SIDE")
 
-    if not reasons:
-        return "PASSED_THRESHOLDS"
+    if reasons:
+        return "+".join(reasons)
 
-    return "+".join(reasons)
+    side_rules = getattr(config, "SIDE_AWARE_WHITELIST", {}) or {}
+    conditional_side_rules = (
+        getattr(config, "CONDITIONAL_SIDE_AWARE_WHITELIST", {}) or {}
+        if bool(getattr(config, "CONDITIONAL_SIDE_AWARE_WHITELIST_ENABLED", True))
+        else {}
+    )
 
+    if side_rules or conditional_side_rules:
+        allowed, admission_source, reject_reason = get_side_admission_result(row)
+
+        if not allowed:
+            return str(reject_reason)
+
+        return str(admission_source)
+
+    return "PASSED_THRESHOLDS"
 
 def build_no_signal_audit_payload() -> Dict[str, object]:
     raw = load_latest_joined_candidates()
@@ -664,11 +771,15 @@ def build_no_signal_audit_payload() -> Dict[str, object]:
         "signal_ts",
         "h4_close",
         "atr14",
+        "gate2_up_reach_high_proba",
+        "gate2_dn_reach_high_proba",
         "gate2_for_side_proba",
+        "gate2_side_margin",
         "gate4_confidence",
         "gate5_1_proba",
         "gate5_3_proba",
         "signal_strength",
+        "admission_source",
         "threshold_reject_reason",
     ]
 
@@ -710,7 +821,7 @@ def log_no_signal_for_latest_h4(source: str) -> None:
     )
 
 
-def select_best_signal() -> Optional[Dict[str, object]]:
+def select_best_signal(entry_block_reason: Optional[str] = None) -> Optional[Dict[str, object]]:
     raw = load_latest_joined_candidates()
     df = normalize_candidates(raw)
     df = keep_latest_signal_ts_only(df)
@@ -752,6 +863,15 @@ def select_best_signal() -> Optional[Dict[str, object]]:
 
     if eligible.empty:
         save_selection_snapshot(checked, best_signal_key=None)
+        log_no_signal(checked)
+        return None
+
+    if entry_block_reason:
+        save_selection_snapshot(
+            checked,
+            best_signal_key=None,
+            entry_block_reason=str(entry_block_reason),
+        )
         log_no_signal(checked)
         return None
 

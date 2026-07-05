@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+from online.oos_context import append_oos_sql_filters, get_online_oos_context
 import argparse
 import json
 import traceback
@@ -883,6 +885,7 @@ def split_by_symbol(df: pd.DataFrame, symbols: List[str]) -> Dict[str, pd.DataFr
     return out
 
 
+
 def get_target_rows_batch(symbols: List[str], rebuild: bool, limit_latest: Optional[int]) -> Dict[str, pd.DataFrame]:
     symbols = sorted(set(str(s).upper() for s in symbols))
     empty = {s: pd.DataFrame(columns=["symbol", "entry_ts"]) for s in symbols}
@@ -890,12 +893,25 @@ def get_target_rows_batch(symbols: List[str], rebuild: bool, limit_latest: Optio
     if not symbols:
         return empty
 
+    where_parts = ["f.symbol = ANY(%s)"]
+    params: List[object] = [symbols]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="f",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
+
     if rebuild or not table_exists(ONLINE_GATE4_PROCESSED_TABLE):
         sql = f"""
-            SELECT symbol, entry_ts
-            FROM {ONLINE_GATE1_FEATURES_TABLE}
-            WHERE symbol = ANY(%s)
-            ORDER BY symbol ASC, entry_ts ASC
+            SELECT f.symbol, f.entry_ts
+            FROM {ONLINE_GATE1_FEATURES_TABLE} f
+            WHERE {where_sql}
+            ORDER BY f.symbol ASC, f.entry_ts ASC
         """
     else:
         sql = f"""
@@ -904,13 +920,13 @@ def get_target_rows_batch(symbols: List[str], rebuild: bool, limit_latest: Optio
             LEFT JOIN {ONLINE_GATE4_PROCESSED_TABLE} p
               ON p.symbol = f.symbol
              AND p.entry_ts = f.entry_ts
-            WHERE f.symbol = ANY(%s)
+            WHERE {where_sql}
               AND p.entry_ts IS NULL
             ORDER BY f.symbol ASC, f.entry_ts ASC
         """
 
     with connect_db() as conn:
-        df = pd.read_sql_query(sql, conn, params=[symbols])
+        df = pd.read_sql_query(sql, conn, params=params)
 
     if df.empty:
         return empty
@@ -926,8 +942,6 @@ def get_target_rows_batch(symbols: List[str], rebuild: bool, limit_latest: Optio
         )
 
     return split_by_symbol(df, symbols)
-
-
 def load_table_context_batch(
     table_name: str,
     symbols: List[str],
@@ -1669,12 +1683,19 @@ def main() -> None:
     ensure_gate4_processed_table()
 
     policy = load_policy()
+    oos_ctx = get_online_oos_context()
 
     if symbol_arg:
         symbols = [symbol_arg]
+    elif oos_ctx.enabled:
+        symbols = list(oos_ctx.symbols)
     else:
         symbols = get_symbols_from_gate1_features()
 
+    print("OOS_MODE:", oos_ctx.enabled)
+    print("OOS_SYMBOLS:", ",".join(oos_ctx.symbols))
+    print("OOS_START:", oos_ctx.start_text)
+    print("OOS_END:", oos_ctx.end_text)
     print("SYMBOLS:", len(symbols))
     print("DB_BATCH_LOAD: target gate4 rows + gate1/gate2/gate3 contexts")
     print()

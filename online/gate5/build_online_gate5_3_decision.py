@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from online.oos_context import append_oos_sql_filters, get_online_oos_context
+
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
@@ -410,6 +412,14 @@ def fetch_gate5_2_batch(conn) -> pd.DataFrame:
     if LOOKBACK_HOURS is not None:
         where_parts.append("s.signal_ts >= NOW() - (%s::text)::interval")
         params.append(f"{LOOKBACK_HOURS} hours")
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="s",
+        ts_column="signal_ts",
+        symbol_column="symbol",
+    )
 
     where_sql = " AND ".join(where_parts)
 
@@ -875,7 +885,12 @@ def main() -> None:
     print("SAFE_GRID_NAME:", SAFE_GRID_NAME)
     print("AGG_GRID_NAME:", AGG_GRID_NAME)
     print("BATCH_LIMIT:", BATCH_LIMIT)
+    oos_ctx = get_online_oos_context()
     print("LOOKBACK_HOURS:", LOOKBACK_HOURS)
+    print("OOS_MODE:", oos_ctx.enabled)
+    print("OOS_SYMBOLS:", ",".join(oos_ctx.symbols))
+    print("OOS_START:", oos_ctx.start_text)
+    print("OOS_END:", oos_ctx.end_text)
     print("REQUIRE_FULL_GRID_COVERAGE:", REQUIRE_FULL_GRID_COVERAGE)
     print()
 

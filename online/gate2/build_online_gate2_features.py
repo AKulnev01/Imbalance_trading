@@ -20,6 +20,8 @@ warnings.filterwarnings(
 import psycopg2
 from psycopg2.extras import execute_values
 
+from online.oos_context import append_oos_sql_filters, get_online_oos_context
+
 
 ROOT = Path(os.environ.get("IMB_PROJECT_ROOT", Path(__file__).resolve().parents[2]))
 
@@ -296,18 +298,31 @@ def get_symbols_from_online_gate1() -> List[str]:
     return [str(x).upper() for x in df["symbol"].tolist()]
 
 
+
 def load_missing_entry_ts_batch(symbols: List[str], rebuild: bool) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame(columns=["symbol", "entry_ts"])
+
+    where_parts = ["UPPER(f.symbol) = ANY(%s)"]
+    params: List[object] = [symbols]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="f",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
 
     if rebuild or not table_exists(ONLINE_GATE2_FEATURES_TABLE):
         query = f"""
             SELECT f.symbol, f.entry_ts
             FROM {ONLINE_GATE1_FEATURES_TABLE} f
-            WHERE UPPER(f.symbol) = ANY(%s)
+            WHERE {where_sql}
             ORDER BY f.symbol, f.entry_ts
         """
-        params = (symbols,)
     else:
         query = f"""
             SELECT f.symbol, f.entry_ts
@@ -315,11 +330,10 @@ def load_missing_entry_ts_batch(symbols: List[str], rebuild: bool) -> pd.DataFra
             LEFT JOIN {ONLINE_GATE2_FEATURES_TABLE} g2
               ON g2.symbol = f.symbol
              AND g2.entry_ts = f.entry_ts
-            WHERE UPPER(f.symbol) = ANY(%s)
+            WHERE {where_sql}
               AND g2.entry_ts IS NULL
             ORDER BY f.symbol, f.entry_ts
         """
-        params = (symbols,)
 
     with connect_db() as conn:
         df = pd.read_sql_query(query, conn, params=params)
@@ -331,8 +345,6 @@ def load_missing_entry_ts_batch(symbols: List[str], rebuild: bool) -> pd.DataFra
     df["entry_ts"] = pd.to_datetime(df["entry_ts"], utc=True, errors="coerce").dt.tz_convert(None)
     df = df.dropna(subset=["symbol", "entry_ts"]).sort_values(["symbol", "entry_ts"]).reset_index(drop=True)
     return df
-
-
 def load_online_gate1_features_batch(symbols: List[str], min_ts: pd.Timestamp, max_ts: pd.Timestamp) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
@@ -439,15 +451,28 @@ def split_by_symbol(df: pd.DataFrame, time_col: str) -> Dict[str, pd.DataFrame]:
     return out
 
 
+
 def get_missing_entry_ts_for_symbol(symbol: str, rebuild: bool) -> pd.DataFrame:
+    where_parts = ["f.symbol = %s"]
+    params: List[object] = [symbol]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="f",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
+
     if rebuild or not table_exists(ONLINE_GATE2_FEATURES_TABLE):
         query = f"""
             SELECT f.symbol, f.entry_ts
             FROM {ONLINE_GATE1_FEATURES_TABLE} f
-            WHERE f.symbol = %s
+            WHERE {where_sql}
             ORDER BY f.entry_ts
         """
-        params = (symbol,)
     else:
         query = f"""
             SELECT f.symbol, f.entry_ts
@@ -455,11 +480,10 @@ def get_missing_entry_ts_for_symbol(symbol: str, rebuild: bool) -> pd.DataFrame:
             LEFT JOIN {ONLINE_GATE2_FEATURES_TABLE} g2
               ON g2.symbol = f.symbol
              AND g2.entry_ts = f.entry_ts
-            WHERE f.symbol = %s
+            WHERE {where_sql}
               AND g2.entry_ts IS NULL
             ORDER BY f.entry_ts
         """
-        params = (symbol,)
 
     with connect_db() as conn:
         df = pd.read_sql_query(query, conn, params=params)
@@ -471,8 +495,6 @@ def get_missing_entry_ts_for_symbol(symbol: str, rebuild: bool) -> pd.DataFrame:
     df["entry_ts"] = pd.to_datetime(df["entry_ts"], utc=True, errors="coerce").dt.tz_convert(None)
     df = df.dropna(subset=["entry_ts"]).sort_values("entry_ts").reset_index(drop=True)
     return df
-
-
 def load_online_gate1_features(symbol: str, min_ts: pd.Timestamp, max_ts: pd.Timestamp) -> pd.DataFrame:
     query = f"""
         SELECT *
@@ -948,12 +970,19 @@ def main() -> None:
     print()
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    oos_ctx = get_online_oos_context()
 
     if symbol_arg:
         symbols = [symbol_arg]
+    elif oos_ctx.enabled:
+        symbols = list(oos_ctx.symbols)
     else:
         symbols = get_symbols_from_online_gate1()
 
+    print("OOS_MODE:", oos_ctx.enabled)
+    print("OOS_SYMBOLS:", ",".join(oos_ctx.symbols))
+    print("OOS_START:", oos_ctx.start_text)
+    print("OOS_END:", oos_ctx.end_text)
     print("SYMBOLS:", len(symbols))
     print("DB_BATCH_LOAD: missing gate2 targets + gate1 features + gate1 predictions + candles_h4")
     print()

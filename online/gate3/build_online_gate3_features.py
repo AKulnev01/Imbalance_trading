@@ -5,11 +5,14 @@ import os
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+from online.oos_context import append_oos_sql_filters, get_online_oos_context
 import argparse
 import json
 import math
 import warnings
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -50,7 +53,8 @@ ENTRY_DELAY_SECONDS = 90
 DEFAULT_CONTEXT_BARS = 96
 DEFAULT_ACTIVE_MAX_BARS = 6
 DEFAULT_ACTIVE_STOP_ATR_MULT = 1.25
-DEFAULT_ACTIVE_WARMUP_BARS = 240
+DEFAULT_ACTIVE_WARMUP_BARS = int(os.environ.get("IMB_GATE3_ACTIVE_WARMUP_BARS", "48"))
+DEFAULT_MAX_WORKERS = int(os.environ.get("IMB_GATE3_BUILD_WORKERS", "8"))
 
 ONLINE_FORBIDDEN_OUTPUT_COLUMNS = {
     "exit_ts",
@@ -1614,7 +1618,6 @@ def add_online_gate3_train_compatible_features(
     out = add_side_active_set_features(out, active_cols=short_active_cols, side="short", prefix="g3_short")
     out = add_generic_all_active_features(out, active_cols=active_cols)
 
-    out = add_quality_interaction_features(out)
     out = add_lag_features(out)
 
     return out
@@ -1632,10 +1635,13 @@ def load_h4_db(symbol: str) -> pd.DataFrame:
     symbol = str(symbol).upper()
 
     if H4_DB_BATCH is not None:
-        return H4_DB_BATCH.get(
+        batch_df = H4_DB_BATCH.get(
             symbol,
             pd.DataFrame(columns=["symbol", "ts", "open", "high", "low", "close", "volume"]),
         ).copy()
+
+        if not batch_df.empty:
+            return batch_df
 
     query = """
         SELECT symbol, entry_ts AS ts, open, high, low, close, volume
@@ -1652,6 +1658,10 @@ def load_h4_db(symbol: str) -> pd.DataFrame:
 
     df["symbol"] = df["symbol"].astype(str).str.upper()
     df["ts"] = to_naive_utc_series(df["ts"])
+
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
     df = df.dropna(subset=["ts"]).sort_values("ts").drop_duplicates("ts", keep="last").reset_index(drop=True)
 
     return df[["symbol", "ts", "open", "high", "low", "close", "volume"]].copy()
@@ -1689,6 +1699,44 @@ def get_symbols_from_gate2_features() -> List[str]:
 
     return [str(x).upper() for x in df["symbol"].tolist()]
 
+
+def build_symbol_time_bounds(
+    symbols: List[str],
+    missing_by_symbol: Optional[Dict[str, pd.DataFrame]],
+    context_bars: int,
+) -> List[Tuple[str, object, object]]:
+    symbols_clean = sorted(set(str(s).upper() for s in symbols))
+    if not symbols_clean:
+        return []
+
+    if missing_by_symbol is None:
+        return []
+
+    extra_bars = int(DEFAULT_ACTIVE_WARMUP_BARS) + int(context_bars) + 5
+    bounds: List[Tuple[str, object, object]] = []
+
+    for symbol in symbols_clean:
+        missing = missing_by_symbol.get(symbol)
+        if missing is None or missing.empty or "entry_ts" not in missing.columns:
+            continue
+
+        ts = pd.to_datetime(missing["entry_ts"], utc=True, errors="coerce").dropna()
+        if ts.empty:
+            continue
+
+        min_ts = pd.Timestamp(ts.min()) - pd.Timedelta(seconds=H4_STEP_SECONDS * extra_bars)
+        max_ts = pd.Timestamp(ts.max())
+
+        bounds.append((
+            symbol,
+            min_ts.to_pydatetime(),
+            max_ts.to_pydatetime(),
+        ))
+
+    return bounds
+
+
+
 def load_missing_gate3_keys_batch(
     symbols: List[str],
     rebuild: bool,
@@ -1697,6 +1745,7 @@ def load_missing_gate3_keys_batch(
     symbols_clean = sorted(set(str(s).upper() for s in symbols))
     if not symbols_clean:
         return {}
+
     max_allowed_entry_ts = latest_available_gate3_source_ts()
 
     if rebuild or not table_exists(ONLINE_GATE3_FEATURES_TABLE):
@@ -1710,6 +1759,25 @@ def load_missing_gate3_keys_batch(
                   AND g3.entry_ts = f.entry_ts
             )
         """
+
+    where_parts = [
+        "f.symbol = ANY(%s)",
+        "f.entry_ts <= %s",
+    ]
+    params: List[object] = [
+        symbols_clean,
+        max_allowed_entry_ts.to_pydatetime(),
+    ]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="f",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
 
     limit_filter = ""
     if limit_latest is not None and int(limit_latest) > 0:
@@ -1729,8 +1797,13 @@ def load_missing_gate3_keys_batch(
                     ORDER BY f.entry_ts DESC
                 ) AS rn
             FROM {ONLINE_GATE2_FEATURES_TABLE} f
-            WHERE f.symbol = ANY(%s)
-              AND f.entry_ts <= %s
+            WHERE {where_sql}
+              AND EXISTS (
+                  SELECT 1
+                  FROM public.candles_h4 c
+                  WHERE c.symbol = f.symbol
+                    AND c.entry_ts = f.entry_ts
+              )
             {where_missing}
         )
         SELECT
@@ -1749,7 +1822,7 @@ def load_missing_gate3_keys_batch(
         df = pd.read_sql_query(
             query,
             conn,
-            params=(symbols_clean, max_allowed_entry_ts.to_pydatetime()),
+            params=params,
         )
 
     result: Dict[str, pd.DataFrame] = {
@@ -1786,9 +1859,11 @@ def load_missing_gate3_keys_batch(
         result[str(symbol).upper()] = g.reset_index(drop=True)
 
     return result
-
-
-def load_gate2_extra_features_batch(symbols: List[str]) -> Dict[str, pd.DataFrame]:
+def load_gate2_extra_features_batch(
+    symbols: List[str],
+    missing_by_symbol: Optional[Dict[str, pd.DataFrame]] = None,
+    context_bars: int = DEFAULT_CONTEXT_BARS,
+) -> Dict[str, pd.DataFrame]:
     symbols_clean = sorted(set(str(s).upper() for s in symbols))
     if not symbols_clean:
         return {}
@@ -1808,22 +1883,39 @@ def load_gate2_extra_features_batch(symbols: List[str]) -> Dict[str, pd.DataFram
         else:
             select_cols.append(f"NULL AS {quote_ident(c)}")
 
-    query = f"""
-        SELECT
-            {", ".join(select_cols)}
-        FROM {ONLINE_GATE2_FEATURES_TABLE} f
-        WHERE f.symbol = ANY(%s)
-        ORDER BY f.symbol ASC, f.entry_ts ASC
-    """
-
-    with connect_db() as conn:
-        df = pd.read_sql_query(query, conn, params=(symbols_clean,))
-
     result: Dict[str, pd.DataFrame] = {
         s: pd.DataFrame(columns=["symbol", "entry_ts", "gate1_proba"])
         for s in symbols_clean
     }
 
+    bounds = build_symbol_time_bounds(
+        symbols=symbols_clean,
+        missing_by_symbol=missing_by_symbol,
+        context_bars=context_bars,
+    )
+    if not bounds:
+        return result
+
+    query = f"""
+        SELECT
+            {", ".join(select_cols)}
+        FROM {ONLINE_GATE2_FEATURES_TABLE} f
+        INNER JOIN (VALUES %s) AS b(symbol, min_ts, max_ts)
+            ON f.symbol = b.symbol
+           AND f.entry_ts >= b.min_ts::timestamptz
+           AND f.entry_ts <= b.max_ts::timestamptz
+        ORDER BY f.symbol ASC, f.entry_ts ASC
+    """
+
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            rows = execute_values(cur, query, bounds, fetch=True)
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+
+    if not rows:
+        return result
+
+    df = pd.DataFrame(rows, columns=cols)
     if df.empty:
         return result
 
@@ -1844,32 +1936,54 @@ def load_gate2_extra_features_batch(symbols: List[str]) -> Dict[str, pd.DataFram
     return result
 
 
-def load_h4_db_batch(symbols: List[str]) -> Dict[str, pd.DataFrame]:
+def load_h4_db_batch(
+    symbols: List[str],
+    missing_by_symbol: Optional[Dict[str, pd.DataFrame]] = None,
+    context_bars: int = DEFAULT_CONTEXT_BARS,
+) -> Dict[str, pd.DataFrame]:
     symbols_clean = sorted(set(str(s).upper() for s in symbols))
     if not symbols_clean:
         return {}
-
-    query = """
-        SELECT
-            symbol,
-            entry_ts AS ts,
-            open,
-            high,
-            low,
-            close,
-            volume
-        FROM public.candles_h4
-        WHERE symbol = ANY(%s)
-        ORDER BY symbol ASC, entry_ts ASC
-    """
-
-    with connect_db() as conn:
-        df = pd.read_sql_query(query, conn, params=(symbols_clean,))
 
     result: Dict[str, pd.DataFrame] = {
         s: pd.DataFrame(columns=["symbol", "ts", "open", "high", "low", "close", "volume"])
         for s in symbols_clean
     }
+
+    bounds = build_symbol_time_bounds(
+        symbols=symbols_clean,
+        missing_by_symbol=missing_by_symbol,
+        context_bars=context_bars,
+    )
+    if not bounds:
+        return result
+
+    query = """
+        SELECT
+            c.symbol,
+            c.entry_ts AS ts,
+            c.open,
+            c.high,
+            c.low,
+            c.close,
+            c.volume
+        FROM public.candles_h4 c
+        INNER JOIN (VALUES %s) AS b(symbol, min_ts, max_ts)
+            ON c.symbol = b.symbol
+           AND c.entry_ts >= b.min_ts::timestamptz
+           AND c.entry_ts <= b.max_ts::timestamptz
+        ORDER BY c.symbol ASC, c.entry_ts ASC
+    """
+
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            rows = execute_values(cur, query, bounds, fetch=True)
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+
+    if not rows:
+        return result
+
+    df = pd.DataFrame(rows, columns=cols)
 
     if df.empty:
         return result
@@ -1891,6 +2005,8 @@ def load_h4_db_batch(symbols: List[str]) -> Dict[str, pd.DataFrame]:
         result[str(symbol).upper()] = g[["symbol", "ts", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
     return result
+
+
 
 def load_missing_gate3_keys(symbol: str, rebuild: bool, limit_latest: Optional[int]) -> pd.DataFrame:
     global MISSING_GATE3_KEYS_BATCH
@@ -1925,6 +2041,25 @@ def load_missing_gate3_keys(symbol: str, rebuild: bool, limit_latest: Optional[i
             )
         """
 
+    where_parts = [
+        "f.symbol = %s",
+        "f.entry_ts <= %s",
+    ]
+    params: List[object] = [
+        symbol,
+        max_allowed_entry_ts.to_pydatetime(),
+    ]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="f",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
+
     limit_clause = ""
     if limit_latest is not None and int(limit_latest) > 0:
         limit_clause = f"LIMIT {int(limit_latest)}"
@@ -1938,8 +2073,7 @@ def load_missing_gate3_keys(symbol: str, rebuild: bool, limit_latest: Optional[i
             f.entry_ts_exec,
             f.entry_px_exec
         FROM {ONLINE_GATE2_FEATURES_TABLE} f
-        WHERE f.symbol = %s
-          AND f.entry_ts <= %s
+        WHERE {where_sql}
         {where_missing}
         ORDER BY f.entry_ts DESC
         {limit_clause}
@@ -1949,7 +2083,7 @@ def load_missing_gate3_keys(symbol: str, rebuild: bool, limit_latest: Optional[i
         df = pd.read_sql_query(
             query,
             conn,
-            params=(symbol, max_allowed_entry_ts.to_pydatetime()),
+            params=params,
         )
 
     if df.empty:
@@ -1965,11 +2099,6 @@ def load_missing_gate3_keys(symbol: str, rebuild: bool, limit_latest: Optional[i
     df = df.reset_index(drop=True)
 
     return df
-
-# ============================================================
-# TABLE
-# ============================================================
-
 def all_output_columns() -> List[str]:
     cols = []
 
@@ -2300,8 +2429,6 @@ def build_features_for_symbol(
 
     
 
-    full_df = add_policy_quality_features(full_df)
-
     full_df = add_online_gate3_train_compatible_features(
         df=full_df,
         symbol=symbol,
@@ -2452,6 +2579,9 @@ def parse_args() -> Tuple[Optional[str], bool, Optional[int], bool, int, int, fl
 def main() -> None:
     symbol_arg, rebuild, limit_latest, dry_run, context_bars, active_max_bars, active_stop_atr_mult = parse_args()
 
+    verbose_symbol_logs = str(os.environ.get("IMB_VERBOSE_SYMBOL_LOGS", "0")).strip().lower() in {"1", "true", "yes", "y"}
+    max_workers = max(1, int(DEFAULT_MAX_WORKERS))
+
     print("ROOT:", ROOT)
     print("DB_DSN:", DB_DSN)
     print("ONLINE_GATE2_FEATURES_TABLE:", ONLINE_GATE2_FEATURES_TABLE)
@@ -2464,22 +2594,33 @@ def main() -> None:
     print("CONTEXT_BARS:", context_bars)
     print("ACTIVE_MAX_BARS:", active_max_bars)
     print("ACTIVE_STOP_ATR_MULT:", active_stop_atr_mult)
+    print("MAX_WORKERS:", max_workers)
     print()
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     ensure_features_table()
+    oos_ctx = get_online_oos_context()
 
     if rebuild and not dry_run and limit_latest is None:
-        clear_features_table()
+        if oos_ctx.enabled:
+            print("REBUILD_WITH_OOS: full features table truncate disabled; OOS rows will be overwritten by upsert")
+        else:
+            clear_features_table()
     elif rebuild and not dry_run and limit_latest is not None:
         print("REBUILD_WITH_LIMIT_LATEST: full table truncate disabled; latest rows will be overwritten by upsert")
 
     if symbol_arg:
         symbols = [symbol_arg]
+    elif oos_ctx.enabled:
+        symbols = list(oos_ctx.symbols)
     else:
         symbols = get_symbols_from_gate2_features()
 
+    print("OOS_MODE:", oos_ctx.enabled)
+    print("OOS_SYMBOLS:", ",".join(oos_ctx.symbols))
+    print("OOS_START:", oos_ctx.start_text)
+    print("OOS_END:", oos_ctx.end_text)
     print("SYMBOLS:", len(symbols))
     print("DB_BATCH_LOAD: missing gate3 keys + gate2 extra features + candles_h4")
     print()
@@ -2493,8 +2634,22 @@ def main() -> None:
         rebuild=rebuild,
         limit_latest=limit_latest,
     )
-    GATE2_EXTRA_FEATURES_BATCH = load_gate2_extra_features_batch(symbols=symbols)
-    H4_DB_BATCH = load_h4_db_batch(symbols=symbols)
+
+    symbols_to_process = [
+        s for s in symbols
+        if s in MISSING_GATE3_KEYS_BATCH and len(MISSING_GATE3_KEYS_BATCH[s]) > 0
+    ]
+
+    GATE2_EXTRA_FEATURES_BATCH = load_gate2_extra_features_batch(
+        symbols=symbols_to_process,
+        missing_by_symbol=MISSING_GATE3_KEYS_BATCH,
+        context_bars=context_bars,
+    )
+    H4_DB_BATCH = load_h4_db_batch(
+        symbols=symbols_to_process,
+        missing_by_symbol=MISSING_GATE3_KEYS_BATCH,
+        context_bars=context_bars,
+    )
 
     missing_total = int(sum(len(x) for x in MISSING_GATE3_KEYS_BATCH.values()))
     missing_symbols = int(sum(1 for x in MISSING_GATE3_KEYS_BATCH.values() if len(x) > 0))
@@ -2503,64 +2658,104 @@ def main() -> None:
 
     print("MISSING_GATE3_KEYS_TOTAL:", missing_total)
     print("MISSING_GATE3_SYMBOLS:", missing_symbols)
+    print("SYMBOLS_TO_PROCESS:", len(symbols_to_process))
     print("GATE2_EXTRA_ROWS_BATCH:", gate2_extra_total)
     print("H4_DB_ROWS_BATCH:", h4_db_total)
     print()
 
     reports = []
-    total_built = 0
-    total_inserted = 0
+    built_frames = []
 
-    for i, symbol in enumerate(symbols, start=1):
-        print(f"[{i}/{len(symbols)}] {symbol}")
+    if symbols_to_process:
+        workers = min(max_workers, len(symbols_to_process))
 
-        try:
-            built, rep = build_features_for_symbol(
-                symbol=symbol,
-                rebuild=rebuild,
-                limit_latest=limit_latest,
-                context_bars=context_bars,
-                active_max_bars=active_max_bars,
-                active_stop_atr_mult=active_stop_atr_mult,
-            )
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_symbol = {}
 
-            total_built += int(len(built))
+            for symbol in symbols_to_process:
+                fut = pool.submit(
+                    build_features_for_symbol,
+                    symbol,
+                    rebuild,
+                    limit_latest,
+                    context_bars,
+                    active_max_bars,
+                    active_stop_atr_mult,
+                )
+                future_to_symbol[fut] = symbol
 
-            if dry_run:
-                inserted = 0
-            else:
-                inserted = insert_features(built)
+            for fut in as_completed(future_to_symbol):
+                symbol = future_to_symbol[fut]
 
-            rep["inserted_rows"] = int(inserted)
-            total_inserted += int(inserted)
+                try:
+                    built, rep = fut.result()
+                    built_frames.append(built)
+                    reports.append(rep)
 
-            reports.append(rep)
+                    if verbose_symbol_logs:
+                        print(
+                            "{} | status={} | source={} | built={} | pa_valid={} | pa_invalid={} | h4_rows={}".format(
+                                symbol,
+                                rep.get("status"),
+                                rep.get("source_rows", 0),
+                                len(built),
+                                rep.get("pa_valid_rows", 0),
+                                rep.get("pa_invalid_rows", 0),
+                                rep.get("h4_rows", 0),
+                            )
+                        )
 
-            print(
-                f"    status={rep['status']} | source={rep['source_rows']} | built={len(built)} "
-                f"| inserted={inserted} | pa_valid={rep['pa_valid_rows']} | pa_invalid={rep['pa_invalid_rows']} "
-                f"| h4_rows={rep['h4_rows']}"
-            )
+                except Exception as e:
+                    rep = {
+                        "symbol": symbol,
+                        "status": "error",
+                        "source_rows": 0,
+                        "built_rows": 0,
+                        "inserted_rows": 0,
+                        "pa_valid_rows": 0,
+                        "pa_invalid_rows": 0,
+                        "h4_rows": 0,
+                        "err": repr(e),
+                    }
+                    reports.append(rep)
+                    print("{} | ERROR: {}".format(symbol, rep["err"]))
 
-            if rep.get("err"):
-                print(f"    ERROR: {rep['err']}")
+    no_missing_symbols = [s for s in symbols if s not in symbols_to_process]
+    for symbol in no_missing_symbols:
+        reports.append({
+            "symbol": symbol,
+            "status": "no_missing",
+            "source_rows": 0,
+            "built_rows": 0,
+            "inserted_rows": 0,
+            "pa_valid_rows": 0,
+            "pa_invalid_rows": 0,
+            "h4_rows": 0,
+            "err": "",
+        })
 
-        except Exception as e:
-            rep = {
-                "symbol": symbol,
-                "status": "error",
-                "source_rows": 0,
-                "built_rows": 0,
-                "inserted_rows": 0,
-                "pa_valid_rows": 0,
-                "pa_invalid_rows": 0,
-                "h4_rows": 0,
-                "err": repr(e),
-            }
-            reports.append(rep)
-            print(f"    ERROR: {rep['err']}")
+    non_empty_built_frames = [x for x in built_frames if x is not None and not x.empty]
+
+    if non_empty_built_frames:
+        all_built = pd.concat(non_empty_built_frames, ignore_index=True)
+    else:
+        all_built = pd.DataFrame()
+
+    total_built = int(len(all_built))
+
+    if dry_run or all_built.empty:
+        total_inserted = 0
+    else:
+        total_inserted = insert_features(all_built)
+
+    for rep in reports:
+        if rep.get("status") == "ok":
+            rep["inserted_rows"] = int(rep.get("built_rows", 0))
 
     rep_df = pd.DataFrame(reports)
+    if len(rep_df):
+        rep_df = rep_df.sort_values("symbol").reset_index(drop=True)
+
     rep_df.to_csv(REPORT_CSV, index=False)
 
     summary = {
@@ -2572,12 +2767,14 @@ def main() -> None:
         "latest_closed_h4_open_ts": str(latest_closed_h4_open_ts()),
         "latest_available_gate3_source_ts": str(latest_available_gate3_source_ts()),
         "symbols_count": int(len(symbols)),
+        "symbols_to_process": int(len(symbols_to_process)),
         "rebuild": bool(rebuild),
         "limit_latest": limit_latest,
         "dry_run": bool(dry_run),
         "context_bars": int(context_bars),
         "active_max_bars": int(active_max_bars),
         "active_stop_atr_mult": float(active_stop_atr_mult),
+        "max_workers": int(max_workers),
         "total_built": int(total_built),
         "total_inserted": int(total_inserted),
         "status_counts": rep_df["status"].value_counts(dropna=False).to_dict() if len(rep_df) else {},
@@ -2590,6 +2787,7 @@ def main() -> None:
     print("=" * 120)
     print("DONE")
     print("STATUS COUNTS:", summary["status_counts"])
+    print("SYMBOLS TO PROCESS:", len(symbols_to_process))
     print("TOTAL BUILT:", total_built)
     print("TOTAL INSERTED:", total_inserted)
     print("WROTE:", REPORT_CSV)

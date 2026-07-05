@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import subprocess
@@ -18,7 +19,7 @@ from online.trading import config
 from online.trading import audit_log
 from online.trading import notify
 from online.trading.db_schema import ensure_trading_schema
-from online.trading.db import read_sql
+from online.trading.db import db_cursor, read_sql
 
 
 SERVICE_NAME = "gate_autotrade_service"
@@ -31,148 +32,51 @@ RUN_EXECUTION_ON_CATCHUP = os.environ.get("IMB_RUN_EXECUTION_ON_CATCHUP", "0").s
 
 H4_AFTER_CLOSE_DELAY_SECONDS = int(os.environ.get("IMB_H4_AFTER_CLOSE_DELAY_SECONDS", "3"))
 H4_LOOP_IDLE_SECONDS = int(os.environ.get("IMB_H4_LOOP_IDLE_SECONDS", "1"))
+SAFETY_LOOP_ENABLED = os.environ.get("IMB_SAFETY_LOOP_ENABLED", "1").strip() != "0"
+SAFETY_LOOP_INTERVAL_SECONDS = int(os.environ.get("IMB_SAFETY_LOOP_INTERVAL_SECONDS", "120"))
+
+TRADE_MANAGEMENT_POLL_ENABLED = os.environ.get("IMB_TRADE_MANAGEMENT_POLL_ENABLED", "1").strip() != "0"
+TRADE_MANAGEMENT_POLL_INTERVAL_SECONDS = int(os.environ.get("IMB_TRADE_MANAGEMENT_POLL_INTERVAL_SECONDS", "30"))
+TRADE_MANAGEMENT_POLL_LOG_INTERVAL_SECONDS = int(os.environ.get("IMB_TRADE_MANAGEMENT_POLL_LOG_INTERVAL_SECONDS", "1800"))
+
+EARLY_STOP_TIMER_ENABLED = os.environ.get("IMB_EARLY_STOP_TIMER_ENABLED", "1").strip() != "0"
+EARLY_STOP_TIMER_IDLE_SECONDS = int(os.environ.get("IMB_EARLY_STOP_TIMER_IDLE_SECONDS", "60"))
+EARLY_STOP_TIMER_MIN_SLEEP_SECONDS = int(os.environ.get("IMB_EARLY_STOP_TIMER_MIN_SLEEP_SECONDS", "1"))
+EARLY_STOP_TIMER_MAX_SLEEP_SECONDS = int(os.environ.get("IMB_EARLY_STOP_TIMER_MAX_SLEEP_SECONDS", "3600"))
+
+WS_LIFECYCLE_ENABLED = os.environ.get("IMB_WS_LIFECYCLE_ENABLED", "1").strip() != "0"
+WS_LISTENER_ENABLED = os.environ.get("IMB_WS_LISTENER_ENABLED", "1").strip() != "0"
+WS_LISTENER_MODULE = os.environ.get("IMB_WS_LISTENER_MODULE", "online.trading.WSListener").strip()
+WS_LISTENER_LOG_PATH = ROOT / "logs" / "ws_listener_latest.log"
+WS_LISTENER_WATCHDOG_INTERVAL_SECONDS = int(os.environ.get("IMB_WS_LISTENER_WATCHDOG_INTERVAL_SECONDS", "30"))
 
 COUNTDOWN_LOG_INTERVAL_SECONDS = int(os.environ.get("IMB_COUNTDOWN_LOG_INTERVAL_SECONDS", "1200"))
 PRE_CLOSE_NOTICE_1_SECONDS = int(os.environ.get("IMB_PRE_CLOSE_NOTICE_1_SECONDS", "60"))
 PRE_CLOSE_NOTICE_2_SECONDS = int(os.environ.get("IMB_PRE_CLOSE_NOTICE_2_SECONDS", "10"))
 
 STOP_EVENT: Optional[asyncio.Event] = None
-
-DB_LOCK_CONN = None
-AUTOTRADE_ADVISORY_LOCK_KEY = 9102026051001
-
-
-def acquire_db_advisory_lock() -> None:
-    global DB_LOCK_CONN
-
-    if DB_LOCK_CONN is not None:
-        return
-
-    try:
-        import psycopg2
-    except Exception as e:
-        raise RuntimeError("psycopg2 import failed for autotrade advisory lock: {}".format(e))
-
-    dsn = str(getattr(config, "DB_DSN", "") or os.environ.get("IMB_DB_DSN", "")).strip()
-    if not dsn:
-        raise RuntimeError("DB_DSN is empty; cannot acquire autotrade advisory lock")
-
-    conn = psycopg2.connect(dsn)
-    conn.autocommit = True
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (AUTOTRADE_ADVISORY_LOCK_KEY,))
-            locked = bool(cur.fetchone()[0])
-    except Exception:
-        conn.close()
-        raise
-
-    if not locked:
-        conn.close()
-        raise RuntimeError(
-            "another autotrade_service already holds PostgreSQL advisory lock: {}".format(
-                AUTOTRADE_ADVISORY_LOCK_KEY
-            )
-        )
-
-    DB_LOCK_CONN = conn
-
-    print("=" * 120, flush=True)
-    print("DB_ADVISORY_LOCK_ACQUIRED", flush=True)
-    print("lock_key:", AUTOTRADE_ADVISORY_LOCK_KEY, flush=True)
-
-
-def release_db_advisory_lock() -> None:
-    global DB_LOCK_CONN
-
-    conn = DB_LOCK_CONN
-    DB_LOCK_CONN = None
-
-    if conn is None:
-        return
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_unlock(%s)", (AUTOTRADE_ADVISORY_LOCK_KEY,))
-    except Exception as e:
-        print("WARNING: failed to release db advisory lock:", e, flush=True)
-
-    try:
-        conn.close()
-    except Exception:
-        pass
-
-ADVISORY_LOCK_CONN = None
-ADVISORY_LOCK_KEY = "imbalance_searcher_autotrade_service_global_lock"
-
-
-def get_db_dsn() -> str:
-    return os.environ.get(
-        "IMB_DB_DSN",
-        config.DB_DSN,
-    )
-
-
-def acquire_global_db_lock() -> None:
-    global ADVISORY_LOCK_CONN
-
-    if ADVISORY_LOCK_CONN is not None:
-        return
-
-    dsn = get_db_dsn()
-    conn = psycopg2.connect(dsn)
-    conn.autocommit = True
-
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT pg_try_advisory_lock(hashtext(%s))",
-            (ADVISORY_LOCK_KEY,),
-        )
-        locked = bool(cur.fetchone()[0])
-
-    if not locked:
-        conn.close()
-        raise RuntimeError(
-            "autotrade service already running: PostgreSQL advisory lock is busy: {}".format(
-                ADVISORY_LOCK_KEY
-            )
-        )
-
-    ADVISORY_LOCK_CONN = conn
-
-    print("=" * 120, flush=True)
-    print("GLOBAL_DB_LOCK_ACQUIRED", flush=True)
-    print("lock_key:", ADVISORY_LOCK_KEY, flush=True)
-    print("db_dsn:", dsn, flush=True)
-
-
-def release_global_db_lock() -> None:
-    global ADVISORY_LOCK_CONN
-
-    conn = ADVISORY_LOCK_CONN
-    ADVISORY_LOCK_CONN = None
-
-    if conn is None:
-        return
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT pg_advisory_unlock(hashtext(%s))",
-                (ADVISORY_LOCK_KEY,),
-            )
-    except Exception as e:
-        print("WARNING: failed to release PostgreSQL advisory lock:", e, flush=True)
-
-    try:
-        conn.close()
-    except Exception:
-        pass
+WS_LISTENER_PROCESS: Optional[subprocess.Popen] = None
 
 DB_LOCK_CONN = None
 DB_LOCK_KEY_1 = 918273645
 DB_LOCK_KEY_2 = 20260510
+
+
+def ensure_trade_management_columns() -> None:
+    sql = """
+        ALTER TABLE public.trading_positions
+            ADD COLUMN IF NOT EXISTS partial_tp_px_plan DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS final_tp_px_plan DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS early_stop_px_plan DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS main_sl_px_plan DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS rest_stop_after_partial_px_plan DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS partial_tp_qty_plan DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS final_tp_qty_plan DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS early_stop_expires_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS trade_management_mode TEXT;
+    """
+    with db_cursor(commit=True) as (_, cur):
+        cur.execute(sql)
 
 
 def utc_now() -> pd.Timestamp:
@@ -343,6 +247,216 @@ def run_module(module_name: str, allow_fail: bool = False) -> int:
 
     return int(proc.returncode)
 
+
+def run_module_capture(module_name: str, allow_fail: bool = False) -> Tuple[int, str]:
+    started = time.time()
+
+    cmd = [sys.executable, "-m", module_name]
+    proc = subprocess.run(
+        cmd,
+        cwd=str(ROOT),
+        env=build_child_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    elapsed = time.time() - started
+    output = str(proc.stdout or "")
+
+    if proc.returncode != 0 and not allow_fail:
+        print("=" * 120, flush=True)
+        print("RUN_MODULE_FAILED:", module_name, flush=True)
+        print("STARTED_AT_UTC:", utc_now(), flush=True)
+        print("ELAPSED_SEC:", round(elapsed, 3), flush=True)
+        print("RETURN_CODE:", proc.returncode, flush=True)
+        print(output.rstrip(), flush=True)
+        raise RuntimeError("module failed: {} return_code={}".format(module_name, proc.returncode))
+
+    return int(proc.returncode), output
+
+def start_ws_listener_process() -> Optional[subprocess.Popen]:
+    if not WS_LISTENER_ENABLED:
+        return None
+
+    try:
+        WS_LISTENER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        log_fh = open(str(WS_LISTENER_LOG_PATH), "a", encoding="utf-8", buffering=1)
+
+        env = build_child_env()
+        env["PYTHONUNBUFFERED"] = "1"
+
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-m", WS_LISTENER_MODULE],
+            cwd=str(ROOT),
+            env=env,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        print("=" * 120, flush=True)
+        print("WS_LISTENER_PROCESS_STARTED", flush=True)
+        print("module:", WS_LISTENER_MODULE, flush=True)
+        print("pid:", proc.pid, flush=True)
+        print("log:", WS_LISTENER_LOG_PATH, flush=True)
+
+        return proc
+
+    except Exception as e:
+        print("=" * 120, flush=True)
+        print("WS_LISTENER_PROCESS_START_FAILED", flush=True)
+        print("module:", WS_LISTENER_MODULE, flush=True)
+        print("error:", e, flush=True)
+        return None
+
+
+def stop_ws_listener_process(proc: Optional[subprocess.Popen]) -> None:
+    if proc is None:
+        return
+
+    try:
+        if proc.poll() is not None:
+            print("WS_LISTENER_PROCESS_ALREADY_EXITED", flush=True)
+            print("pid:", proc.pid, flush=True)
+            print("return_code:", proc.returncode, flush=True)
+            return
+
+        print("=" * 120, flush=True)
+        print("WS_LISTENER_PROCESS_STOPPING", flush=True)
+        print("pid:", proc.pid, flush=True)
+
+        proc.terminate()
+
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print("WS_LISTENER_PROCESS_KILLING", flush=True)
+            print("pid:", proc.pid, flush=True)
+            proc.kill()
+            proc.wait(timeout=10)
+
+        print("WS_LISTENER_PROCESS_STOPPED", flush=True)
+        print("pid:", proc.pid, flush=True)
+        print("return_code:", proc.returncode, flush=True)
+
+    except Exception as e:
+        print("WS_LISTENER_PROCESS_STOP_ERROR:", e, flush=True)
+
+
+async def ws_listener_watchdog_loop() -> None:
+    global WS_LISTENER_PROCESS
+
+    if not WS_LIFECYCLE_ENABLED:
+        print("WS_LISTENER_WATCHDOG_DISABLED", flush=True)
+        return
+
+    print("WS_LISTENER_WATCHDOG_STARTED", flush=True)
+    print("WS_LISTENER_MODULE:", WS_LISTENER_MODULE, flush=True)
+    print("WS_LISTENER_WATCHDOG_INTERVAL_SECONDS:", WS_LISTENER_WATCHDOG_INTERVAL_SECONDS, flush=True)
+
+    if WS_LISTENER_PROCESS is None:
+        WS_LISTENER_PROCESS = start_ws_listener_process()
+
+    while STOP_EVENT is None or not STOP_EVENT.is_set():
+        try:
+            if WS_LISTENER_PROCESS is None:
+                WS_LISTENER_PROCESS = start_ws_listener_process()
+
+            elif WS_LISTENER_PROCESS.poll() is not None:
+                print("=" * 120, flush=True)
+                print("WS_LISTENER_PROCESS_EXITED_RESTARTING", flush=True)
+                print("old_pid:", WS_LISTENER_PROCESS.pid, flush=True)
+                print("return_code:", WS_LISTENER_PROCESS.returncode, flush=True)
+
+                WS_LISTENER_PROCESS = start_ws_listener_process()
+
+        except Exception as e:
+            print("WS_LISTENER_WATCHDOG_ERROR:", e, flush=True)
+
+            write_audit_event(
+                event_type="WS_LISTENER_WATCHDOG_ERROR",
+                status="ERROR",
+                message=str(e),
+                payload={
+                    "module": WS_LISTENER_MODULE,
+                    "dry_run": get_dry_run(),
+                },
+            )
+
+            notify_safe(
+                event_type="WS_LISTENER_WATCHDOG_ERROR",
+                status="ERROR",
+                payload={
+                    "error": str(e),
+                    "module": WS_LISTENER_MODULE,
+                    "dry_run": get_dry_run(),
+                },
+                force=True,
+            )
+
+        await sleep_interruptible(WS_LISTENER_WATCHDOG_INTERVAL_SECONDS)
+
+
+def parse_last_json_line(text: str) -> Optional[dict]:
+    for raw in reversed(str(text or "").splitlines()):
+        line = raw.strip()
+        if not line:
+            continue
+
+        if not line.startswith("{"):
+            continue
+
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+
+        if isinstance(obj, dict):
+            return obj
+
+    return None
+
+
+def should_log_protective_orders_result(return_code: int, output: str) -> bool:
+    if int(return_code) != 0:
+        return True
+
+    obj = parse_last_json_line(output)
+
+    if obj is None:
+        return True
+
+    status = str(obj.get("status") or "").strip().upper()
+
+    cancelled = int(obj.get("cancelled") or 0)
+    failed = int(obj.get("failed") or 0)
+    stale_orders = int(obj.get("stale_orders") or 0)
+    checked_orders = int(obj.get("checked_orders") or 0)
+    errors = obj.get("errors") or []
+
+    if failed > 0:
+        return True
+
+    if cancelled > 0:
+        return True
+
+    if stale_orders > 0:
+        return True
+
+    if errors:
+        return True
+
+    if status not in {"NO_ACTIVE_PROTECTIVE_ORDERS", "DONE"}:
+        return True
+
+    if status == "DONE" and checked_orders > 0:
+        return True
+
+    return False
 
 def run_step(script_path: Path, allow_fail: bool = False) -> int:
     if not script_path.exists():
@@ -531,6 +645,7 @@ def print_h4_decision_report(close_ts: pd.Timestamp) -> None:
             gate5_1_proba,
             gate5_3_proba,
             signal_strength,
+            candidate_rank,
             selected,
             rejected,
             reject_reason,
@@ -600,6 +715,285 @@ def print_h4_decision_report(close_ts: pd.Timestamp) -> None:
     print("signal_strength:", fmt_float(row.get("signal_strength")), flush=True)
     print("reject_reason:", row.get("reject_reason"), flush=True)
 
+    print("-" * 120, flush=True)
+    print("H4_CANDIDATES", flush=True)
+
+    for _, cand in df.iterrows():
+        cand_symbol = str(cand.get("symbol") or "").upper()
+        cand_side = str(cand.get("side") or "").upper()
+        cand_selected = bool(cand.get("selected"))
+        cand_rejected = bool(cand.get("rejected"))
+
+        cand_reason = str(cand.get("reject_reason") or "")
+        if not cand_reason or cand_reason.lower() == "nan":
+            cand_reason = "OK" if cand_selected and not cand_rejected else "NO_REASON"
+
+        marker = "TOP" if str(cand.get("signal_key") or "") == str(row.get("signal_key") or "") else "   "
+
+        print(
+            "{} | rank={} | {} {} | g2={} / {} | g4={} / {} | g5_1={} / {} | g5_3={} / {} | strength={} | selected={} | rejected={} | reason={}".format(
+                marker,
+                cand.get("candidate_rank") if "candidate_rank" in cand.index else "-",
+                cand_symbol,
+                cand_side,
+                fmt_float(cand.get("gate2_proba")),
+                config.GATE2_THR,
+                fmt_float(cand.get("gate4_confidence")),
+                config.GATE4_THR,
+                fmt_float(cand.get("gate5_1_proba")),
+                config.GATE5_1_THR,
+                fmt_float(cand.get("gate5_3_proba")),
+                config.GATE5_3_THR,
+                fmt_float(cand.get("signal_strength")),
+                cand_selected,
+                cand_rejected,
+                cand_reason,
+            ),
+            flush=True,
+        )
+
+
+def first_existing_table_column(table_name: str, candidates) -> Optional[str]:
+    try:
+        df = read_sql(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            """,
+            [str(table_name)],
+        )
+    except Exception as e:
+        print("FIRST_EXISTING_TABLE_COLUMN_ERROR:", table_name, e, flush=True)
+        return None
+
+    if df.empty:
+        return None
+
+    cols = set(str(x) for x in df["column_name"].tolist())
+
+    for candidate in candidates:
+        if str(candidate) in cols:
+            return str(candidate)
+
+    return None
+
+
+def backfill_catchup_trading_signals_from_gate5_3() -> None:
+    g53_proba_col = first_existing_table_column(
+        "online_gate5_3_decisions",
+        [
+            "gate5_3_proba",
+            "pred_proba",
+            "proba",
+            "decision_proba",
+            "selected_proba",
+            "probability",
+        ],
+    )
+
+    if g53_proba_col is None:
+        print("CATCHUP_HISTORY_BACKFILL_SKIPPED: no Gate5.3 probability column", flush=True)
+        return
+
+    sql = """
+    WITH missing_ts AS (
+        SELECT DISTINCT g53.signal_ts
+        FROM public.online_gate5_3_decisions g53
+        LEFT JOIN public.trading_signals s
+            ON s.signal_ts = g53.signal_ts
+        WHERE g53.signal_ts >= NOW() - INTERVAL '14 days'
+          AND g53.signal_ts < NOW()
+        GROUP BY g53.signal_ts
+        HAVING COUNT(s.signal_key) = 0
+    ),
+    base AS (
+        SELECT
+            g53.signal_ts,
+            g53.symbol,
+            UPPER(COALESCE(g53.side, '')) AS side,
+
+            COALESCE(NULLIF(g53.pair_model_name, ''), %s::text) AS pair_model_name,
+            COALESCE(NULLIF(g53.chosen_grid_name, ''), %s::text) AS grid_name,
+            COALESCE(g53.chosen_tp_atr, %s::double precision) AS tp_atr,
+            COALESCE(g53.chosen_sl_atr, %s::double precision) AS sl_atr,
+            %s::double precision AS ttl_hours,
+
+            gf.close::double precision AS h4_close,
+            gf.atr14::double precision AS atr14,
+            gf.gate2_proba::double precision AS gate2_proba,
+
+            g52.gate4_confidence::double precision AS gate4_confidence,
+            g51.gate5_1_proba::double precision AS gate5_1_proba,
+            g53.{g53_proba_col}::double precision AS gate5_3_proba
+        FROM public.online_gate5_3_decisions g53
+        JOIN missing_ts mt
+            ON mt.signal_ts = g53.signal_ts
+
+        LEFT JOIN public.online_gate5_2_ranker g52
+            ON g52.signal_ts = g53.signal_ts
+           AND g52.symbol = g53.symbol
+           AND UPPER(COALESCE(g52.side, '')) = UPPER(COALESCE(g53.side, ''))
+           AND COALESCE(NULLIF(g52.grid_name, ''), '') = COALESCE(NULLIF(g53.chosen_grid_name, ''), '')
+
+        LEFT JOIN public.online_gate5_1_scores g51
+            ON g51.signal_ts = g53.signal_ts
+           AND g51.symbol = g53.symbol
+           AND UPPER(COALESCE(g51.side, '')) = UPPER(COALESCE(g53.side, ''))
+           AND COALESCE(NULLIF(g51.grid_name, ''), '') = COALESCE(NULLIF(g53.chosen_grid_name, ''), '')
+
+        LEFT JOIN public.online_gate4_features gf
+            ON gf.symbol = g53.symbol
+           AND gf.entry_ts = g53.signal_ts
+    ),
+    ranked AS (
+        SELECT
+            *,
+            (
+                COALESCE(gate2_proba, 0)
+                + COALESCE(gate4_confidence, 0)
+                + COALESCE(gate5_1_proba, 0)
+                + COALESCE(gate5_3_proba, 0)
+            ) AS signal_strength,
+            ROW_NUMBER() OVER (
+                PARTITION BY signal_ts
+                ORDER BY
+                    (
+                        COALESCE(gate2_proba, 0)
+                        + COALESCE(gate4_confidence, 0)
+                        + COALESCE(gate5_1_proba, 0)
+                        + COALESCE(gate5_3_proba, 0)
+                    ) DESC,
+                    symbol ASC,
+                    side ASC
+            ) AS candidate_rank
+        FROM base
+    ),
+    prepared AS (
+        SELECT
+            'catchup_' || md5(signal_ts::text || '|' || symbol || '|' || side || '|' || pair_model_name || '|' || grid_name) AS signal_key,
+            signal_ts,
+            symbol,
+            side,
+            signal_ts + INTERVAL '4 hours' AS entry_ts_plan,
+            pair_model_name,
+            grid_name,
+            tp_atr,
+            sl_atr,
+            ttl_hours,
+            gate2_proba,
+            gate4_confidence,
+            gate5_1_proba,
+            gate5_3_proba,
+            signal_strength,
+            FALSE AS selected,
+            TRUE AS rejected,
+            CASE
+                WHEN COALESCE(gate2_proba, 0) < %s THEN 'BELOW_GATE2'
+                WHEN COALESCE(gate4_confidence, 0) < %s THEN 'BELOW_GATE4'
+                WHEN COALESCE(gate5_1_proba, 0) < %s THEN 'BELOW_GATE5_1'
+                WHEN COALESCE(gate5_3_proba, 0) < %s THEN 'BELOW_GATE5_3'
+                ELSE 'CATCHUP_ENTRY_WINDOW_EXPIRED'
+            END AS reject_reason,
+            h4_close,
+            atr14,
+            NULL::boolean AS dynamic_symbol_allowed,
+            'CATCHUP_HISTORY_BACKFILL_NO_EXECUTION'::text AS dynamic_symbol_reason,
+            candidate_rank,
+            'catchup_gate5_3_history_v1'::text AS selector_version,
+            NOW() AS created_at,
+            NOW() AS updated_at
+        FROM ranked
+    )
+    INSERT INTO public.trading_signals (
+        signal_key,
+        symbol,
+        signal_ts,
+        entry_ts_plan,
+        side,
+        pair_model_name,
+        grid_name,
+        tp_atr,
+        sl_atr,
+        ttl_hours,
+        gate2_proba,
+        gate4_confidence,
+        gate5_1_proba,
+        gate5_3_proba,
+        signal_strength,
+        selected,
+        rejected,
+        reject_reason,
+        created_at,
+        updated_at,
+        h4_close,
+        atr14,
+        dynamic_symbol_allowed,
+        dynamic_symbol_reason,
+        candidate_rank,
+        selector_version
+    )
+    SELECT
+        signal_key,
+        symbol,
+        signal_ts,
+        entry_ts_plan,
+        side,
+        pair_model_name,
+        grid_name,
+        tp_atr,
+        sl_atr,
+        ttl_hours,
+        gate2_proba,
+        gate4_confidence,
+        gate5_1_proba,
+        gate5_3_proba,
+        signal_strength,
+        selected,
+        rejected,
+        reject_reason,
+        created_at,
+        updated_at,
+        h4_close,
+        atr14,
+        dynamic_symbol_allowed,
+        dynamic_symbol_reason,
+        candidate_rank,
+        selector_version
+    FROM prepared
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM public.trading_signals s
+        WHERE s.signal_ts = prepared.signal_ts
+          AND s.symbol = prepared.symbol
+          AND UPPER(COALESCE(s.side, '')) = UPPER(COALESCE(prepared.side, ''))
+    )
+    """.format(
+        g53_proba_col=g53_proba_col,
+    )
+
+    with db_cursor(commit=True) as (_, cur):
+        cur.execute(
+            sql,
+            (
+                str(config.PAIR_MODEL_NAME),
+                str(config.GRID_NAME),
+                float(config.TP_ATR),
+                float(config.SL_ATR),
+                float(config.TTL_HOURS),
+                float(config.GATE2_THR),
+                float(config.GATE4_THR),
+                float(config.GATE5_1_THR),
+                float(config.GATE5_3_THR),
+            ),
+        )
+        inserted = cur.rowcount
+
+    print("=" * 120, flush=True)
+    print("CATCHUP_HISTORY_BACKFILL_FROM_GATE5_3", flush=True)
+    print("inserted_trading_signals:", int(inserted), flush=True)
+    print("mode: no execution, history/report only", flush=True)
 
 async def sleep_interruptible(seconds: float) -> None:
     if seconds <= 0:
@@ -649,9 +1043,41 @@ async def startup_catchup_once() -> None:
                     continue
                 run_step(step_path, allow_fail=False)
 
-            run_module("online.trading.selector", allow_fail=False)
-
             catchup_close_ts = latest_closed_h4_open_utc() + pd.Timedelta(hours=4)
+
+            try:
+                backfill_catchup_trading_signals_from_gate5_3()
+            except Exception as e:
+                print("=" * 120, flush=True)
+                print("STARTUP_CATCHUP_HISTORY_BACKFILL_ERROR", flush=True)
+                print("error_type:", type(e).__name__, flush=True)
+                print("error:", e, flush=True)
+                print("message: catchup history backfill failed, but autotrade service startup continues", flush=True)
+
+                write_audit_event(
+                    event_type="STARTUP_CATCHUP_HISTORY_BACKFILL_ERROR",
+                    status="ERROR",
+                    message=str(e),
+                    payload={
+                        "dry_run": get_dry_run(),
+                    },
+                )
+
+                notify_safe(
+                    event_type="STARTUP_CATCHUP_HISTORY_BACKFILL_ERROR",
+                    status="ERROR",
+                    payload={
+                        "error": str(e),
+                        "dry_run": get_dry_run(),
+                    },
+                    force=True,
+                )
+
+            print("=" * 120, flush=True)
+            print("STARTUP_CATCHUP_HISTORY_REPORTED", flush=True)
+            print("reason: catchup_without_execution_writes_history_only", flush=True)
+            print("catchup_close_ts:", catchup_close_ts, flush=True)
+
             print_h4_decision_report(catchup_close_ts)
 
         write_audit_event(
@@ -681,6 +1107,537 @@ async def startup_catchup_once() -> None:
         )
         raise
 
+def has_active_db_position() -> bool:
+    sql = """
+        SELECT 1
+        FROM public.trading_positions
+        WHERE status IN (
+            'ENTRY_ORDER_SENT',
+            'ENTRY_PARTIALLY_FILLED',
+            'ENTRY_FILLED',
+            'TP_SL_PLACED',
+            'POSITION_OPEN',
+            'TTL_CLOSE_SENT',
+            'TTL_CLOSE_FAILED'
+        )
+        LIMIT 1
+    """
+
+    try:
+        df = read_sql(sql)
+    except Exception as e:
+        print("SAFETY_LOOP_ACTIVE_POSITION_CHECK_ERROR:", e, flush=True)
+        return False
+
+    return not df.empty
+
+
+def get_next_early_stop_due_ts() -> Optional[pd.Timestamp]:
+    sql = """
+        SELECT MIN(early_stop_expires_at) AS due_ts
+        FROM public.trading_positions
+        WHERE status IN (
+            'ENTRY_ORDER_SENT',
+            'ENTRY_PARTIALLY_FILLED',
+            'ENTRY_FILLED',
+            'TP_SL_PLACED',
+            'POSITION_OPEN',
+            'TTL_CLOSE_SENT',
+            'TTL_CLOSE_FAILED'
+        )
+          AND early_stop_expires_at IS NOT NULL
+          AND trade_management_mode IS NOT NULL
+    """
+
+    try:
+        df = read_sql(sql)
+    except Exception as e:
+        print("EARLY_STOP_TIMER_DUE_TS_ERROR:", e, flush=True)
+        return None
+
+    if df.empty:
+        return None
+
+    due_ts = pd.to_datetime(df.iloc[0].get("due_ts"), utc=True, errors="coerce")
+
+    if pd.isna(due_ts):
+        return None
+
+    return due_ts
+
+
+def is_soft_bybit_network_output(output: str) -> bool:
+    text = str(output or "").lower()
+
+    markers = [
+        "read timed out",
+        "readtimeout",
+        "handshake operation timed out",
+        "socket.timeout",
+        "retryable error occurred",
+        "recv_window",
+        "errcode: 10002",
+        "10002",
+        "httpsconnectionpool",
+        "api.bybit.com",
+        "connection aborted",
+        "connection reset",
+        "max retries exceeded",
+    ]
+
+    return any(marker in text for marker in markers)
+
+
+def compact_soft_module_error(module_name: str, return_code: int, output: str) -> str:
+    lines = []
+
+    for raw in str(output or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        line_l = line.lower()
+
+        if "read timed out" in line_l:
+            lines.append(line)
+        elif "handshake operation timed out" in line_l:
+            lines.append(line)
+        elif "socket.timeout" in line_l:
+            lines.append(line)
+        elif "retryable error occurred" in line_l:
+            lines.append(line)
+        elif "recv_window" in line_l:
+            lines.append(line)
+        elif "10002" in line_l:
+            lines.append(line)
+        elif "httpsconnectionpool" in line_l:
+            lines.append(line)
+        elif "requests.exceptions" in line_l:
+            lines.append(line)
+
+    if not lines:
+        lines = ["soft network error"]
+
+    return "{}_SOFT_NETWORK_ERROR rc={} | {}".format(
+        str(module_name).upper().replace(".", "_"),
+        int(return_code),
+        " | ".join(lines[-3:])[:1000],
+    )
+
+
+def run_trade_management_sync_capture(reason: str) -> Tuple[bool, str]:
+    chunks = []
+    ok = True
+
+    rc, out = run_module_capture("online.trading.reconcile", allow_fail=True)
+    if int(rc) == 0:
+        chunks.append("RECONCILE rc={}\n{}".format(rc, out.rstrip()))
+    elif is_soft_bybit_network_output(out):
+        chunks.append(compact_soft_module_error("online.trading.reconcile", int(rc), out))
+    else:
+        chunks.append("RECONCILE rc={}\n{}".format(rc, out.rstrip()))
+        ok = False
+
+    rc, out = run_module_capture("online.trading.monitor", allow_fail=True)
+    if int(rc) == 0:
+        chunks.append("MONITOR rc={}\n{}".format(rc, out.rstrip()))
+    elif is_soft_bybit_network_output(out):
+        chunks.append(compact_soft_module_error("online.trading.monitor", int(rc), out))
+    else:
+        chunks.append("MONITOR rc={}\n{}".format(rc, out.rstrip()))
+        ok = False
+
+    rc, out = run_module_capture("online.trading.cancel_stale_protective_orders", allow_fail=True)
+    if int(rc) == 0:
+        chunks.append("CANCEL_STALE rc={}\n{}".format(rc, out.rstrip()))
+    elif is_soft_bybit_network_output(out):
+        chunks.append(compact_soft_module_error("online.trading.cancel_stale_protective_orders", int(rc), out))
+    else:
+        chunks.append("CANCEL_STALE rc={}\n{}".format(rc, out.rstrip()))
+        ok = False
+
+    return bool(ok), "\n".join(chunks)
+
+
+def output_has_important_trade_management_event(output: str) -> bool:
+    text = str(output or "")
+    text_u = text.upper()
+
+    soft_markers = [
+        "ONLINE_TRADING_RECONCILE_SOFT_NETWORK_ERROR",
+        "ONLINE_TRADING_MONITOR_SOFT_NETWORK_ERROR",
+        "ONLINE_TRADING_CANCEL_STALE_PROTECTIVE_ORDERS_SOFT_NETWORK_ERROR",
+        "LOCK_BUSY: TRADING_RECONCILE",
+    ]
+
+    text_for_check = text_u
+
+    for marker in soft_markers:
+        text_for_check = text_for_check.replace(marker, "")
+
+    hard_markers = [
+        "REST_STOP_AFTER_PARTIAL_PLACED",
+        "REST_STOP_AFTER_PARTIAL_FAILED",
+        "EARLY_STOP_REPLACED_WITH_MAIN_SL",
+        "MAIN_SL_PLACE_FAILED",
+        "TTL_CLOSE_SENT",
+        "TTL_CLOSE_FAILED",
+        "EXCHANGE_POSITION_ZERO_DETECTED",
+        "POSITION_ZERO_CANCEL_ALL_PROTECTIVE_ORDERS",
+        "CANCEL_FAILED",
+        "RECONCILE_CLOSED_POSITION_CLEANUP_WARNING",
+    ]
+
+    for marker in hard_markers:
+        if marker in text_for_check:
+            return True
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        line_u = line.upper()
+
+        if not line:
+            continue
+
+        if line_u == "LOCK_BUSY: TRADING_RECONCILE":
+            continue
+
+        if "_SOFT_NETWORK_ERROR" in line_u:
+            continue
+
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                obj = None
+
+            if isinstance(obj, dict):
+                status = str(obj.get("status") or "").upper()
+                cancelled = int(obj.get("cancelled") or 0)
+                failed = int(obj.get("failed") or 0)
+                stale_orders = int(obj.get("stale_orders") or 0)
+                errors = obj.get("errors") or []
+
+                if failed > 0 or cancelled > 0 or stale_orders > 0 or errors:
+                    return True
+
+                if status not in {"NO_ACTIVE_PROTECTIVE_ORDERS", "DONE"}:
+                    return True
+
+                continue
+
+        if line_u.startswith("ERROR:"):
+            return True
+
+        if line_u.startswith("FAILED:"):
+            return True
+
+    return False
+
+
+async def trade_management_poll_loop() -> None:
+    if not TRADE_MANAGEMENT_POLL_ENABLED:
+        print("TRADE_MANAGEMENT_POLL_DISABLED", flush=True)
+        return
+
+    print("TRADE_MANAGEMENT_POLL_STARTED", flush=True)
+    print("TRADE_MANAGEMENT_POLL_INTERVAL_SECONDS:", TRADE_MANAGEMENT_POLL_INTERVAL_SECONDS, flush=True)
+    print("TRADE_MANAGEMENT_POLL_LOG_INTERVAL_SECONDS:", TRADE_MANAGEMENT_POLL_LOG_INTERVAL_SECONDS, flush=True)
+
+    last_log_mono = 0.0
+
+    while STOP_EVENT is None or not STOP_EVENT.is_set():
+        try:
+            active_position_exists = has_active_db_position()
+
+            if not active_position_exists:
+                await sleep_interruptible(TRADE_MANAGEMENT_POLL_INTERVAL_SECONDS)
+                continue
+
+            started_at = utc_now()
+            ok, output = run_trade_management_sync_capture(reason="POLL_30_SECONDS")
+
+            now_mono = time.time()
+            log_by_interval = (now_mono - last_log_mono) >= float(TRADE_MANAGEMENT_POLL_LOG_INTERVAL_SECONDS)
+            log_by_event = output_has_important_trade_management_event(output)
+            log_by_error = not ok
+
+            if log_by_interval or log_by_event or log_by_error:
+                print("=" * 120, flush=True)
+                print("TRADE_MANAGEMENT_POLL_SYNC", flush=True)
+                print("started_at_utc:", started_at, flush=True)
+                print("finished_at_utc:", utc_now(), flush=True)
+                print("dry_run:", get_dry_run(), flush=True)
+                print("ok:", ok, flush=True)
+                print("log_reason_interval:", log_by_interval, flush=True)
+                print("log_reason_event:", log_by_event, flush=True)
+                print("log_reason_error:", log_by_error, flush=True)
+                if output.strip():
+                    print(output.rstrip(), flush=True)
+                last_log_mono = now_mono
+
+            if not ok:
+                write_audit_event(
+                    event_type="TRADE_MANAGEMENT_POLL_ERROR",
+                    status="ERROR",
+                    message="trade management poll failed",
+                    payload={
+                        "output_tail": str(output or "")[-3000:],
+                        "dry_run": get_dry_run(),
+                    },
+                )
+
+                notify_safe(
+                    event_type="TRADE_MANAGEMENT_POLL_ERROR",
+                    status="ERROR",
+                    payload={
+                        "output_tail": str(output or "")[-1000:],
+                        "dry_run": get_dry_run(),
+                    },
+                    force=True,
+                )
+
+        except Exception as e:
+            write_audit_event(
+                event_type="TRADE_MANAGEMENT_POLL_FATAL_ERROR",
+                status="ERROR",
+                message=str(e),
+                payload={"dry_run": get_dry_run()},
+            )
+
+            notify_safe(
+                event_type="TRADE_MANAGEMENT_POLL_FATAL_ERROR",
+                status="ERROR",
+                payload={"error": str(e), "dry_run": get_dry_run()},
+                force=True,
+            )
+
+            print("TRADE_MANAGEMENT_POLL_FATAL_ERROR:", e, flush=True)
+
+        await sleep_interruptible(TRADE_MANAGEMENT_POLL_INTERVAL_SECONDS)
+
+
+async def early_stop_timer_loop() -> None:
+    if not EARLY_STOP_TIMER_ENABLED:
+        print("EARLY_STOP_TIMER_DISABLED", flush=True)
+        return
+
+    print("EARLY_STOP_TIMER_STARTED", flush=True)
+    print("EARLY_STOP_TIMER_IDLE_SECONDS:", EARLY_STOP_TIMER_IDLE_SECONDS, flush=True)
+    print("EARLY_STOP_TIMER_MIN_SLEEP_SECONDS:", EARLY_STOP_TIMER_MIN_SLEEP_SECONDS, flush=True)
+    print("EARLY_STOP_TIMER_MAX_SLEEP_SECONDS:", EARLY_STOP_TIMER_MAX_SLEEP_SECONDS, flush=True)
+
+    while STOP_EVENT is None or not STOP_EVENT.is_set():
+        try:
+            due_ts = get_next_early_stop_due_ts()
+
+            if due_ts is None:
+                await sleep_interruptible(EARLY_STOP_TIMER_IDLE_SECONDS)
+                continue
+
+            left_seconds = seconds_until(due_ts)
+
+            if left_seconds > 0:
+                sleep_seconds = min(
+                    float(EARLY_STOP_TIMER_MAX_SLEEP_SECONDS),
+                    max(float(EARLY_STOP_TIMER_MIN_SLEEP_SECONDS), float(left_seconds)),
+                )
+
+                print("=" * 120, flush=True)
+                print("EARLY_STOP_TIMER_WAIT", flush=True)
+                print("next_due_ts_utc:", due_ts, flush=True)
+                print("left:", fmt_left(left_seconds), flush=True)
+                print("sleep_seconds:", round(sleep_seconds, 3), flush=True)
+
+                await sleep_interruptible(sleep_seconds)
+                continue
+
+            started_at = utc_now()
+            ok, output = run_trade_management_sync_capture(reason="EARLY_STOP_EXPIRES_AT_DUE")
+
+            print("=" * 120, flush=True)
+            print("EARLY_STOP_TIMER_SYNC", flush=True)
+            print("started_at_utc:", started_at, flush=True)
+            print("finished_at_utc:", utc_now(), flush=True)
+            print("dry_run:", get_dry_run(), flush=True)
+            print("ok:", ok, flush=True)
+            if output.strip():
+                print(output.rstrip(), flush=True)
+
+            if not ok:
+                write_audit_event(
+                    event_type="EARLY_STOP_TIMER_ERROR",
+                    status="ERROR",
+                    message="early stop timer sync failed",
+                    payload={
+                        "output_tail": str(output or "")[-3000:],
+                        "dry_run": get_dry_run(),
+                    },
+                )
+
+                notify_safe(
+                    event_type="EARLY_STOP_TIMER_ERROR",
+                    status="ERROR",
+                    payload={
+                        "output_tail": str(output or "")[-1000:],
+                        "dry_run": get_dry_run(),
+                    },
+                    force=True,
+                )
+
+            await sleep_interruptible(EARLY_STOP_TIMER_MIN_SLEEP_SECONDS)
+
+        except Exception as e:
+            write_audit_event(
+                event_type="EARLY_STOP_TIMER_FATAL_ERROR",
+                status="ERROR",
+                message=str(e),
+                payload={"dry_run": get_dry_run()},
+            )
+
+            notify_safe(
+                event_type="EARLY_STOP_TIMER_FATAL_ERROR",
+                status="ERROR",
+                payload={"error": str(e), "dry_run": get_dry_run()},
+                force=True,
+            )
+
+            print("EARLY_STOP_TIMER_FATAL_ERROR:", e, flush=True)
+            await sleep_interruptible(EARLY_STOP_TIMER_IDLE_SECONDS)
+
+
+async def safety_loop() -> None:
+    if not SAFETY_LOOP_ENABLED:
+        print("SAFETY_LOOP_DISABLED", flush=True)
+        return
+
+    print("SAFETY_LOOP_STARTED", flush=True)
+    print("SAFETY_LOOP_INTERVAL_SECONDS:", SAFETY_LOOP_INTERVAL_SECONDS, flush=True)
+
+    while STOP_EVENT is None or not STOP_EVENT.is_set():
+        try:
+            started_at = utc_now()
+            active_position_exists = has_active_db_position()
+            if active_position_exists and WS_LIFECYCLE_ENABLED:
+                await sleep_interruptible(SAFETY_LOOP_INTERVAL_SECONDS)
+                continue
+
+            if active_position_exists and TRADE_MANAGEMENT_POLL_ENABLED:
+                await sleep_interruptible(SAFETY_LOOP_INTERVAL_SECONDS)
+                continue
+
+            if active_position_exists:
+                print("=" * 120, flush=True)
+                print("SAFETY_LOOP_ACTIVE_POSITION_SYNC_START", flush=True)
+                print("started_at_utc:", started_at, flush=True)
+                print("dry_run:", get_dry_run(), flush=True)
+
+                run_module("online.trading.reconcile", allow_fail=True)
+                run_module("online.trading.monitor", allow_fail=True)
+
+                return_code, output = run_module_capture(
+                    "online.trading.cancel_stale_protective_orders",
+                    allow_fail=True,
+                )
+
+                if should_log_protective_orders_result(return_code, output):
+                    print("=" * 120, flush=True)
+                    print("SAFETY_LOOP_PROTECTIVE_ORDERS_RESULT", flush=True)
+                    print("started_at_utc:", started_at, flush=True)
+                    print("dry_run:", get_dry_run(), flush=True)
+                    print("return_code:", return_code, flush=True)
+
+                    if output.strip():
+                        print(output.rstrip(), flush=True)
+
+                if int(return_code) != 0:
+                    write_audit_event(
+                        event_type="SAFETY_LOOP_PROTECTIVE_ORDERS_ERROR",
+                        status="ERROR",
+                        message="cancel_stale_protective_orders failed",
+                        payload={
+                            "return_code": int(return_code),
+                            "output": str(output or "")[-3000:],
+                            "dry_run": get_dry_run(),
+                        },
+                    )
+
+                    notify_safe(
+                        event_type="SAFETY_LOOP_PROTECTIVE_ORDERS_ERROR",
+                        status="ERROR",
+                        payload={
+                            "return_code": int(return_code),
+                            "output_tail": str(output or "")[-1000:],
+                            "dry_run": get_dry_run(),
+                        },
+                        force=True,
+                    )
+
+                print("SAFETY_LOOP_ACTIVE_POSITION_SYNC_DONE", flush=True)
+                print("finished_at_utc:", utc_now(), flush=True)
+
+            else:
+                return_code, output = run_module_capture(
+                    "online.trading.cancel_stale_protective_orders",
+                    allow_fail=True,
+                )
+
+                if should_log_protective_orders_result(return_code, output):
+                    print("=" * 120, flush=True)
+                    print("SAFETY_LOOP_PROTECTIVE_ORDERS_RESULT", flush=True)
+                    print("started_at_utc:", started_at, flush=True)
+                    print("dry_run:", get_dry_run(), flush=True)
+                    print("return_code:", return_code, flush=True)
+
+                    if output.strip():
+                        print(output.rstrip(), flush=True)
+
+                if int(return_code) != 0:
+                    write_audit_event(
+                        event_type="SAFETY_LOOP_PROTECTIVE_ORDERS_ERROR",
+                        status="ERROR",
+                        message="cancel_stale_protective_orders failed",
+                        payload={
+                            "return_code": int(return_code),
+                            "output": str(output or "")[-3000:],
+                            "dry_run": get_dry_run(),
+                        },
+                    )
+
+                    notify_safe(
+                        event_type="SAFETY_LOOP_PROTECTIVE_ORDERS_ERROR",
+                        status="ERROR",
+                        payload={
+                            "return_code": int(return_code),
+                            "output_tail": str(output or "")[-1000:],
+                            "dry_run": get_dry_run(),
+                        },
+                        force=True,
+                    )
+
+        except Exception as e:
+            write_audit_event(
+                event_type="SAFETY_LOOP_ERROR",
+                status="ERROR",
+                message=str(e),
+                payload={
+                    "dry_run": get_dry_run(),
+                },
+            )
+
+            notify_safe(
+                event_type="SAFETY_LOOP_ERROR",
+                status="ERROR",
+                payload={
+                    "error": str(e),
+                    "dry_run": get_dry_run(),
+                },
+                force=True,
+            )
+
+            print("SAFETY_LOOP_ERROR:", e, flush=True)
+
+        await sleep_interruptible(SAFETY_LOOP_INTERVAL_SECONDS)
 
 async def wait_until_h4_target(close_ts: pd.Timestamp, target_ts: pd.Timestamp) -> None:
     last_countdown_log_mono = 0.0
@@ -827,7 +1784,6 @@ async def h4_close_loop() -> None:
 
         await sleep_interruptible(H4_LOOP_IDLE_SECONDS)
 
-
 async def main_async() -> None:
     global STOP_EVENT
 
@@ -840,6 +1796,7 @@ async def main_async() -> None:
 
     try:
         ensure_trading_schema()
+        ensure_trade_management_columns()
         audit_log.ensure_audit_tables()
 
         print("=" * 120, flush=True)
@@ -852,6 +1809,18 @@ async def main_async() -> None:
         print("THRS:", config.GATE2_THR, config.GATE4_THR, config.GATE5_1_THR, config.GATE5_3_THR, flush=True)
         print("DYNAMIC_BLACKLIST_SOURCE:", str(getattr(config, "DYNAMIC_BLACKLIST_SOURCE", "prod")), flush=True)
         print("H4_AFTER_CLOSE_DELAY_SECONDS:", H4_AFTER_CLOSE_DELAY_SECONDS, flush=True)
+        print("SAFETY_LOOP_ENABLED:", SAFETY_LOOP_ENABLED, flush=True)
+        print("SAFETY_LOOP_INTERVAL_SECONDS:", SAFETY_LOOP_INTERVAL_SECONDS, flush=True)
+        print("TRADE_MANAGEMENT_POLL_ENABLED:", TRADE_MANAGEMENT_POLL_ENABLED, flush=True)
+        print("TRADE_MANAGEMENT_POLL_INTERVAL_SECONDS:", TRADE_MANAGEMENT_POLL_INTERVAL_SECONDS, flush=True)
+        print("TRADE_MANAGEMENT_POLL_LOG_INTERVAL_SECONDS:", TRADE_MANAGEMENT_POLL_LOG_INTERVAL_SECONDS, flush=True)
+        print("EARLY_STOP_TIMER_ENABLED:", EARLY_STOP_TIMER_ENABLED, flush=True)
+        print("EARLY_STOP_TIMER_IDLE_SECONDS:", EARLY_STOP_TIMER_IDLE_SECONDS, flush=True)
+        print("EARLY_STOP_TIMER_MIN_SLEEP_SECONDS:", EARLY_STOP_TIMER_MIN_SLEEP_SECONDS, flush=True)
+        print("EARLY_STOP_TIMER_MAX_SLEEP_SECONDS:", EARLY_STOP_TIMER_MAX_SLEEP_SECONDS, flush=True)
+        print("WS_LIFECYCLE_ENABLED:", WS_LIFECYCLE_ENABLED, flush=True)
+        print("WS_LISTENER_MODULE:", WS_LISTENER_MODULE, flush=True)
+        print("WS_LISTENER_WATCHDOG_INTERVAL_SECONDS:", WS_LISTENER_WATCHDOG_INTERVAL_SECONDS, flush=True)
         print("COUNTDOWN_LOG_INTERVAL_SECONDS:", COUNTDOWN_LOG_INTERVAL_SECONDS, flush=True)
         print("PRE_CLOSE_NOTICE_1_SECONDS:", PRE_CLOSE_NOTICE_1_SECONDS, flush=True)
         print("PRE_CLOSE_NOTICE_2_SECONDS:", PRE_CLOSE_NOTICE_2_SECONDS, flush=True)
@@ -871,7 +1840,13 @@ async def main_async() -> None:
                 "gate5_1_thr": config.GATE5_1_THR,
                 "gate5_3_thr": config.GATE5_3_THR,
                 "dynamic_blacklist_source": str(getattr(config, "DYNAMIC_BLACKLIST_SOURCE", "prod")),
-                "mode": "h4_only_no_background_monitor_reconcile",
+                "mode": "h4_with_ws_lifecycle_watchdog",
+                "trade_management_poll_enabled": TRADE_MANAGEMENT_POLL_ENABLED,
+                "trade_management_poll_interval_seconds": TRADE_MANAGEMENT_POLL_INTERVAL_SECONDS,
+                "trade_management_poll_log_interval_seconds": TRADE_MANAGEMENT_POLL_LOG_INTERVAL_SECONDS,
+                "early_stop_timer_enabled": EARLY_STOP_TIMER_ENABLED,
+                "ws_lifecycle_enabled": WS_LIFECYCLE_ENABLED,
+                "ws_listener_module": WS_LISTENER_MODULE,
             },
         )
 
@@ -882,21 +1857,50 @@ async def main_async() -> None:
                 "pid": os.getpid(),
                 "dry_run": get_dry_run(),
                 "grid_name": config.GRID_NAME,
-                "mode": "h4_only",
+                "mode": "h4_with_ws_lifecycle_watchdog",
             },
             force=True,
         )
 
         await startup_catchup_once()
 
-        task = asyncio.create_task(h4_close_loop())
+        tasks = []
+
+        h4_task = asyncio.create_task(h4_close_loop())
+        safety_task = asyncio.create_task(safety_loop())
+        ws_listener_task = asyncio.create_task(ws_listener_watchdog_loop())
+
+        tasks.append(h4_task)
+        tasks.append(safety_task)
+        tasks.append(ws_listener_task)
+
+        if TRADE_MANAGEMENT_POLL_ENABLED and not WS_LIFECYCLE_ENABLED:
+            trade_management_poll_task = asyncio.create_task(trade_management_poll_loop())
+            tasks.append(trade_management_poll_task)
+        else:
+            print("TRADE_MANAGEMENT_POLL_NOT_STARTED", flush=True)
+            print("reason:", "WS_LIFECYCLE_ENABLED" if WS_LIFECYCLE_ENABLED else "TRADE_MANAGEMENT_POLL_DISABLED", flush=True)
+
+        if EARLY_STOP_TIMER_ENABLED and not WS_LIFECYCLE_ENABLED:
+            early_stop_timer_task = asyncio.create_task(early_stop_timer_loop())
+            tasks.append(early_stop_timer_task)
+        else:
+            print("EARLY_STOP_TIMER_NOT_STARTED", flush=True)
+            print("reason:", "WS_LIFECYCLE_ENABLED" if WS_LIFECYCLE_ENABLED else "EARLY_STOP_TIMER_DISABLED", flush=True)
 
         await STOP_EVENT.wait()
 
         print("STOP_SIGNAL_RECEIVED", flush=True)
 
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        for task in tasks:
+            task.cancel()
+
+        await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
+
+        stop_ws_listener_process(WS_LISTENER_PROCESS)
 
         write_audit_event(
             event_type="AUTOTRADE_SERVICE_STOPPED",
@@ -921,6 +1925,8 @@ async def main_async() -> None:
 
     finally:
 
+        stop_ws_listener_process(WS_LISTENER_PROCESS)
+
         release_process_lock()
 
         release_db_advisory_lock()
@@ -940,8 +1946,6 @@ def main() -> None:
         raise
     finally:
         release_process_lock()
-        release_db_advisory_lock()
-        release_db_advisory_lock()
         release_db_advisory_lock()
 
 

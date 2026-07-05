@@ -1,8 +1,23 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal, ROUND_DOWN
 import time
 from typing import Any, Dict, List, Optional
+
+
+
+def format_bybit_decimal(value, max_decimals=8):
+    dec = Decimal(str(value))
+    quant = Decimal("1").scaleb(-int(max_decimals))
+    dec = dec.quantize(quant, rounding=ROUND_DOWN)
+
+    text = format(dec, "f").rstrip("0").rstrip(".")
+
+    if text == "" or text == "-0":
+        return "0"
+
+    return text
 
 
 class BybitClient:
@@ -85,6 +100,73 @@ class BybitClient:
             "tick_size": float(price_filter.get("tickSize") or 0.0),
         }
 
+    def set_symbol_leverage(
+        self,
+        symbol: str,
+        leverage: float,
+    ) -> Dict[str, Any]:
+        session = self._get_session()
+
+        leverage_f = float(leverage)
+        if leverage_f <= 0.0:
+            raise RuntimeError("bad leverage: {}".format(leverage))
+
+        leverage_text = str(int(leverage_f)) if leverage_f.is_integer() else str(leverage_f)
+
+        try:
+            resp = session.set_leverage(
+                category=self.category,
+                symbol=str(symbol).upper(),
+                buyLeverage=leverage_text,
+                sellLeverage=leverage_text,
+            )
+        except Exception as e:
+            error_text = str(e)
+            if "110043" in error_text or "not modified" in error_text.lower():
+                return {
+                    "ok": True,
+                    "already_set": True,
+                    "symbol": str(symbol).upper(),
+                    "leverage": leverage_f,
+                    "response": {
+                        "retCode": 110043,
+                        "retMsg": error_text,
+                    },
+                }
+            raise
+
+        ret_code = int(resp.get("retCode", -1))
+        ret_msg = str(resp.get("retMsg") or "")
+
+        if ret_code == 0:
+            return {
+                "ok": True,
+                "already_set": False,
+                "symbol": str(symbol).upper(),
+                "leverage": leverage_f,
+                "response": resp,
+            }
+
+        if ret_code == 110043 or "not modified" in ret_msg.lower():
+            return {
+                "ok": True,
+                "already_set": True,
+                "symbol": str(symbol).upper(),
+                "leverage": leverage_f,
+                "response": resp,
+            }
+
+        self._raise_if_bad(resp)
+
+        return {
+            "ok": True,
+            "already_set": False,
+            "symbol": str(symbol).upper(),
+            "leverage": leverage_f,
+            "response": resp,
+        }
+
+
     def place_market_order(
         self,
         symbol: str,
@@ -102,7 +184,7 @@ class BybitClient:
             symbol=symbol,
             side=bybit_side,
             orderType="Market",
-            qty=str(qty),
+            qty=format_bybit_decimal(qty),
             reduceOnly=bool(reduce_only),
             orderLinkId=order_link_id,
         )
@@ -130,7 +212,67 @@ class BybitClient:
             symbol=str(symbol).upper(),
             side=close_side,
             orderType="Market",
-            qty=str(qty),
+            qty=format_bybit_decimal(qty),
+            reduceOnly=True,
+            orderLinkId=str(order_link_id),
+        )
+        self._raise_if_bad(resp)
+        return resp
+
+    def get_close_order_side_and_trigger_directions(self, side: str) -> Dict[str, Any]:
+        side_u = str(side).upper().strip()
+
+        if side_u == "LONG":
+            return {
+                "close_side": "Sell",
+                "tp_trigger_direction": 1,
+                "sl_trigger_direction": 2,
+            }
+
+        if side_u == "SHORT":
+            return {
+                "close_side": "Buy",
+                "tp_trigger_direction": 2,
+                "sl_trigger_direction": 1,
+            }
+
+        raise RuntimeError("bad side for protective order: {}".format(side))
+
+    def place_reduce_only_trigger_market_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        trigger_px: float,
+        trigger_kind: str,
+        order_link_id: str,
+    ) -> Dict[str, Any]:
+        session = self._get_session()
+
+        if float(qty) <= 0.0:
+            raise RuntimeError("bad qty for trigger order: {}".format(qty))
+
+        if float(trigger_px) <= 0.0:
+            raise RuntimeError("bad trigger_px for trigger order: {}".format(trigger_px))
+
+        trigger_kind_u = str(trigger_kind).upper().strip()
+        dirs = self.get_close_order_side_and_trigger_directions(side)
+
+        if trigger_kind_u == "TP":
+            trigger_direction = int(dirs["tp_trigger_direction"])
+        elif trigger_kind_u == "SL":
+            trigger_direction = int(dirs["sl_trigger_direction"])
+        else:
+            raise RuntimeError("bad trigger_kind: {}. Use TP or SL".format(trigger_kind))
+
+        resp = session.place_order(
+            category=self.category,
+            symbol=str(symbol).upper(),
+            side=str(dirs["close_side"]),
+            orderType="Market",
+            triggerPrice=str(trigger_px),
+            triggerDirection=trigger_direction,
+            qty=format_bybit_decimal(qty),
             reduceOnly=True,
             orderLinkId=str(order_link_id),
         )
@@ -147,50 +289,105 @@ class BybitClient:
             tp_order_link_id: str,
             sl_order_link_id: str,
     ) -> Dict[str, Any]:
-        session = self._get_session()
-
-        side_u = str(side).upper()
-        if side_u == "LONG":
-            close_side = "Sell"
-            tp_trigger_direction = 1
-            sl_trigger_direction = 2
-        elif side_u == "SHORT":
-            close_side = "Buy"
-            tp_trigger_direction = 2
-            sl_trigger_direction = 1
-        else:
-            raise RuntimeError("bad side for TP/SL orders: {}".format(side))
-
-        sl_resp = session.place_order(
-            category=self.category,
-            symbol=str(symbol).upper(),
-            side=close_side,
-            orderType="Market",
-            triggerPrice=str(sl_px),
-            triggerDirection=sl_trigger_direction,
-            qty=str(qty),
-            reduceOnly=True,
-            orderLinkId=str(sl_order_link_id),
+        sl_resp = self.place_reduce_only_trigger_market_order(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            trigger_px=sl_px,
+            trigger_kind="SL",
+            order_link_id=sl_order_link_id,
         )
-        self._raise_if_bad(sl_resp)
 
-        tp_resp = session.place_order(
-            category=self.category,
-            symbol=str(symbol).upper(),
-            side=close_side,
-            orderType="Market",
-            triggerPrice=str(tp_px),
-            triggerDirection=tp_trigger_direction,
-            qty=str(qty),
-            reduceOnly=True,
-            orderLinkId=str(tp_order_link_id),
+        tp_resp = self.place_reduce_only_trigger_market_order(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            trigger_px=tp_px,
+            trigger_kind="TP",
+            order_link_id=tp_order_link_id,
         )
-        self._raise_if_bad(tp_resp)
 
         return {
             "take_profit": tp_resp,
             "stop_loss": sl_resp,
         }
+
+    def place_partial_final_tp_and_sl_orders(
+        self,
+        symbol: str,
+        side: str,
+        total_qty: float,
+        partial_tp_qty: float,
+        final_tp_qty: float,
+        sl_qty: float,
+        partial_tp_px: float,
+        final_tp_px: float,
+        sl_px: float,
+        partial_tp_order_link_id: str,
+        final_tp_order_link_id: str,
+        sl_order_link_id: str,
+    ) -> Dict[str, Any]:
+        if float(total_qty) <= 0.0:
+            raise RuntimeError("bad total_qty: {}".format(total_qty))
+
+        if float(partial_tp_qty) <= 0.0:
+            raise RuntimeError("bad partial_tp_qty: {}".format(partial_tp_qty))
+
+        if float(final_tp_qty) <= 0.0:
+            raise RuntimeError("bad final_tp_qty: {}".format(final_tp_qty))
+
+        if float(sl_qty) <= 0.0:
+            raise RuntimeError("bad sl_qty: {}".format(sl_qty))
+
+        sl_resp = self.place_reduce_only_trigger_market_order(
+            symbol=symbol,
+            side=side,
+            qty=sl_qty,
+            trigger_px=sl_px,
+            trigger_kind="SL",
+            order_link_id=sl_order_link_id,
+        )
+
+        partial_tp_resp = self.place_reduce_only_trigger_market_order(
+            symbol=symbol,
+            side=side,
+            qty=partial_tp_qty,
+            trigger_px=partial_tp_px,
+            trigger_kind="TP",
+            order_link_id=partial_tp_order_link_id,
+        )
+
+        final_tp_resp = self.place_reduce_only_trigger_market_order(
+            symbol=symbol,
+            side=side,
+            qty=final_tp_qty,
+            trigger_px=final_tp_px,
+            trigger_kind="TP",
+            order_link_id=final_tp_order_link_id,
+        )
+
+        return {
+            "partial_take_profit": partial_tp_resp,
+            "final_take_profit": final_tp_resp,
+            "stop_loss": sl_resp,
+        }
+
+    def place_rest_stop_after_partial_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        rest_stop_px: float,
+        order_link_id: str,
+    ) -> Dict[str, Any]:
+        return self.place_reduce_only_trigger_market_order(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            trigger_px=rest_stop_px,
+            trigger_kind="SL",
+            order_link_id=order_link_id,
+        )
 
     def get_order_history(self, symbol: str, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> Dict[str, Any]:
         session = self._get_session()
@@ -320,7 +517,7 @@ class BybitClient:
 
     def cancel_order(self, symbol: str, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> Dict[str, Any]:
         session = self._get_session()
-        kwargs = {"category": self.category, "symbol": symbol}
+        kwargs = {"category": self.category, "symbol": str(symbol).upper()}
 
         if order_id:
             kwargs["orderId"] = order_id
@@ -330,6 +527,44 @@ class BybitClient:
         resp = session.cancel_order(**kwargs)
         self._raise_if_bad(resp)
         return resp
+
+    def cancel_order_safe(self, symbol: str, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> Dict[str, Any]:
+        try:
+            return self.cancel_order(
+                symbol=symbol,
+                order_id=order_id,
+                order_link_id=order_link_id,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "symbol": str(symbol).upper(),
+                "order_id": order_id,
+                "order_link_id": order_link_id,
+            }
+    def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        session = self._get_session()
+
+        kwargs: Dict[str, Any] = {
+            "category": self.category,
+            "openOnly": 0,
+        }
+
+        if symbol:
+            kwargs["symbol"] = str(symbol).upper()
+        else:
+            kwargs["settleCoin"] = "USDT"
+
+        resp = session.get_open_orders(**kwargs)
+        self._raise_if_bad(resp)
+
+        rows = (resp.get("result") or {}).get("list") or []
+
+        if not isinstance(rows, list):
+            return []
+
+        return rows
 
     def _raise_if_bad(self, resp: Dict[str, Any]) -> None:
         ret_code = int(resp.get("retCode", -1))

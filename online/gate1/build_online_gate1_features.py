@@ -14,6 +14,8 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 
+from online.oos_context import append_oos_sql_filters, get_online_oos_context
+
 from production.features.build_features_full import build_features_single_symbol
 
 
@@ -149,6 +151,7 @@ def read_h4_parquet(symbol: str) -> pd.DataFrame:
 
 
 
+
 def read_h4_db_all(symbols: List[str]) -> Dict[str, pd.DataFrame]:
     symbols = sorted(set(str(x).upper() for x in symbols if str(x).strip()))
 
@@ -156,24 +159,37 @@ def read_h4_db_all(symbols: List[str]) -> Dict[str, pd.DataFrame]:
     if not symbols:
         return {}
 
-    sql = """
+    where_parts = ["UPPER(c.symbol) = ANY(%s)"]
+    params: List[object] = [symbols]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="c",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
+
+    sql = f"""
         SELECT
-            symbol,
-            entry_ts,
-            open,
-            high,
-            low,
-            close,
-            volume
-        FROM public.candles_h4
-        WHERE symbol = ANY(%s)
-        ORDER BY symbol ASC, entry_ts ASC;
+            c.symbol,
+            c.entry_ts,
+            c.open,
+            c.high,
+            c.low,
+            c.close,
+            c.volume
+        FROM public.candles_h4 c
+        WHERE {where_sql}
+        ORDER BY c.symbol ASC, c.entry_ts ASC;
     """
 
     with connect_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SET TIME ZONE 'UTC';")
-            cur.execute(sql, (symbols,))
+            cur.execute(sql, tuple(params))
             rows = cur.fetchall()
 
     if not rows:
@@ -202,8 +218,6 @@ def read_h4_db_all(symbols: List[str]) -> Dict[str, pd.DataFrame]:
         result[symbol] = part
 
     return result
-
-
 def read_h4_db(symbol: str) -> pd.DataFrame:
     return read_h4_db_all([symbol]).get(
         str(symbol).upper(),
@@ -373,6 +387,7 @@ def create_or_update_online_gate1_features_table(template_df: pd.DataFrame) -> N
 
 
 
+
 def get_existing_feature_ts_all(symbols: List[str]) -> Dict[str, set]:
     symbols = sorted(set(str(x).upper() for x in symbols if str(x).strip()))
 
@@ -380,18 +395,31 @@ def get_existing_feature_ts_all(symbols: List[str]) -> Dict[str, set]:
     if not symbols:
         return result
 
+    where_parts = ["UPPER(f.symbol) = ANY(%s)"]
+    params: List[object] = [symbols]
+
+    append_oos_sql_filters(
+        where_parts=where_parts,
+        params=params,
+        table_alias="f",
+        ts_column="entry_ts",
+        symbol_column="symbol",
+    )
+
+    where_sql = " AND ".join(where_parts)
+
     sql = f"""
         SELECT
-            symbol,
-            entry_ts
-        FROM {table_qname(ONLINE_TABLE)}
-        WHERE symbol = ANY(%s);
+            f.symbol,
+            f.entry_ts
+        FROM {table_qname(ONLINE_TABLE)} f
+        WHERE {where_sql};
     """
 
     with connect_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SET TIME ZONE 'UTC';")
-            cur.execute(sql, (symbols,))
+            cur.execute(sql, tuple(params))
             rows = cur.fetchall()
 
     for symbol, entry_ts in rows:
@@ -402,8 +430,6 @@ def get_existing_feature_ts_all(symbols: List[str]) -> Dict[str, set]:
         result.setdefault(symbol_u, set()).add(ts.tz_convert(None))
 
     return result
-
-
 def get_existing_feature_ts(symbol: str) -> set:
     symbol_u = str(symbol).upper()
     return get_existing_feature_ts_all([symbol_u]).get(symbol_u, set())
@@ -670,9 +696,17 @@ def main() -> None:
     print()
 
     create_or_update_online_gate1_features_table(template_df)
+    oos_ctx = get_online_oos_context()
 
-    symbols = get_symbols_from_h4_context_dir()
+    if oos_ctx.enabled:
+        symbols = list(oos_ctx.symbols)
+    else:
+        symbols = get_symbols_from_h4_context_dir()
 
+    print("OOS_MODE:", oos_ctx.enabled)
+    print("OOS_SYMBOLS:", ",".join(oos_ctx.symbols))
+    print("OOS_START:", oos_ctx.start_text)
+    print("OOS_END:", oos_ctx.end_text)
     print("SYMBOLS:", len(symbols))
     print("DB_BATCH_LOAD: candles_h4 + existing online_gate1_features")
     print()

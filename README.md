@@ -6,7 +6,7 @@ Production-проект многоуровневой ML-системы для а
 
 Архитектура построена как каскад моделей:
 
-Gate1 → Gate2 → Gate3 → Gate4 → Gate5.1 → Gate5.2 → Gate5.3 → selector → execution
+Gate1 → Gate2 → Gate3 → Gate4 → Gate5.1 → Gate5.2 → Gate5.3 → selector → execution → monitor/reconcile
 
 Каждый gate решает отдельную задачу. Итоговое решение формируется не одной моделью, а последовательностью фильтров, скорингов и проверок.
 
@@ -1402,3 +1402,330 @@ ImbalanceSearcher — это не одна модель и не простой �
 оценить TP/SL,
 открыть позицию market-ордером,
 и контролировать её через Bybit + PostgreSQL.
+
+⸻
+
+33. Гибкое добавление новых символов / tiker_upload
+
+В проект добавлена система безопасного добавления нового торгового символа в production-pipeline.
+
+Смысл:
+
+раньше система была жёстко завязана на заранее подготовленный набор символов, датасетов и моделей. Теперь новый символ можно добавить через управляемую offline/online цепочку без ручного прохождения всех этапов.
+
+Новый символ проходит отдельный onboarding pipeline:
+
+symbol decision
+↓
+window planning
+↓
+download m1/H4
+↓
+Gate1 dataset
+↓
+Gate1 train
+↓
+Gate3 PA dataset
+↓
+Gate3 active regime / policy
+↓
+Gate3 score
+↓
+OOS candles DB load
+↓
+online OOS pipeline
+↓
+Gate5.1 / Gate5.2 / Gate5.3 rows in DB
+↓
+symbol becomes available for backtest / selector
+
+Основные файлы add-symbol control:
+
+online/new/actions/control/symbol_onboarding_decision.py
+online/new/actions/control/onboarding_window_plan.py
+online/new/actions/control/offline_pipeline_plan.py
+online/new/actions/control/offline_pipeline_executor.py
+online/new/actions/control/oos_validation_db_loader.py
+online/new/actions/control/online_oos_pipeline_runner.py
+online/trading/service_status.py
+
+Основной сервисный вход:
+
+python -m online.trading.service_status add-symbol SYMBOL START_DATE END_DATE --run-tag RUN_TAG --timeout-sec 7200 --valid-days 60 --execute
+
+Пример:
+
+python -m online.trading.service_status add-symbol AVNTUSDT "2000-01-01 00:00" "2099-01-01 00:00" --run-tag tg_add_symbol_avntusdt_20260629_131501 --timeout-sec 7200 --valid-days 60 --execute
+
+Важная логика add-symbol:
+
+* если символ уже полностью добавлен и есть строки в online_gate5_3_decisions — система возвращает ALREADY_EXISTS;
+* если символ не существует на Bybit futures/perpetual — система возвращает REJECTED;
+* если futures-истории мало — система возвращает REJECTED;
+* если символ частично добавлен после прерванного запуска — retry должен продолжаться идемпотентно;
+* OOS-загрузка свечей использует on-conflict skip, чтобы повторный запуск не падал на уже загруженных свечах;
+* Gate3 для нового символа не должен быть fatal, если active edge/policy отсутствует;
+* при отсутствии Gate3 policy для символа используется fallback: Gate3 disabled для этого символа, pipeline продолжается.
+
+Ключевой принцип:
+
+новый символ добавляется только через явный add-symbol flow. Обычный запуск системы не должен сам создавать новые модели или менять production-артефакты.
+
+⸻
+
+34. Admin retrain / переобучение candidate-моделей на свежих данных
+
+В проект добавлен отдельный admin-режим переобучения моделей на расширенных свежих датасетах.
+
+Смысл:
+
+со временем появляются новые свечные данные. Чтобы проверить, стали ли новые модели лучше старых, система должна уметь построить новые candidate-датасеты и candidate-модели рядом с production, не перетирая текущий боевой baseline.
+
+Это не add-symbol и не обычный online-run.
+
+Это отдельный controlled retrain mode:
+
+candidate_retrain
+
+Главный принцип безопасности:
+
+по умолчанию candidate_retrain ничего не запускает и ничего не записывает.
+
+То есть простой вызов режима без явных флагов должен давать пустой enabled steps list.
+
+Production-модели нельзя перетирать автоматически.
+
+Разрешены только два случая записи новых моделей:
+
+1. Добавление нового символа через add-symbol.
+2. Полный candidate retrain через явный admin-флаг.
+
+Для полного переобучения требуется явный флаг:
+
+--full-candidate-retrain
+
+Для фактического запуска executor требуется дополнительный явный флаг:
+
+--execute
+
+Без --execute система строит только план.
+
+Без --full-candidate-retrain запуск с --execute запрещён.
+
+Защита:
+
+--execute без --full-candidate-retrain должен падать с ошибкой:
+
+--execute is forbidden without --full-candidate-retrain
+
+Это сделано специально, чтобы случайный admin-запуск не начал обучение.
+
+⸻
+
+35. Candidate retrain flow
+
+Admin retrain строит новую candidate-цепочку:
+
+download m1/H4
+↓
+Gate1 candidate dataset
+↓
+Gate1 candidate train
+↓
+Gate2 candidate dataset
+↓
+Gate2 candidate train
+↓
+Gate3 candidate PA dataset
+↓
+Gate3 candidate active regime / policy
+↓
+Gate3 candidate score train
+↓
+Gate4 candidate dataset
+↓
+Gate4 candidate train
+↓
+Gate4 candidate predictions
+↓
+Gate5 candidate pair datasets
+↓
+Gate5.1 candidate train
+↓
+Gate5.2 candidate ranker dataset
+↓
+Gate5.3 candidate pairwise dataset
+↓
+Gate5.3 candidate train
+↓
+candidate backtest / comparison
+↓
+manual or controlled promotion if better
+
+Candidate retrain не должен писать в online trading DB.
+
+Candidate retrain не должен обновлять production registry автоматически.
+
+Candidate retrain не должен менять active baseline без отдельного promote step.
+
+Все candidate outputs пишутся в отдельные tagged folders.
+
+Пример candidate paths:
+
+data/m1_4/<run_tag>
+data/h4_3/<run_tag>
+
+production/dataset/gate1_candidates/<run_tag>
+production/models/final_gate1_candidates/<run_tag>
+
+production/dataset/gate2_candidates/<run_tag>
+production/models/gate2_mod_5features_candidates/<run_tag>
+
+production/dataset/pa_gate3_v3_long_short_candidates/<run_tag>
+production/models/ks_candidates/<run_tag>
+production/models/final_gate3_score_long_short_candidates/<run_tag>
+
+production/dataset/gate4_candidates/<run_tag>
+production/models/gate4_candidates/<run_tag>
+
+production/dataset/gate5_candidates/<run_tag>
+production/models/gate5_1_candidates/<run_tag>
+production/models/gate5_3_candidates/<run_tag>
+
+Run artifacts:
+
+production/artifacts/candidate_retrain_runs/<run_tag>/
+
+Внутри run artifacts сохраняются:
+
+01_offline_pipeline_plan.json
+summary.json
+offline_executor_runs/
+
+⸻
+
+36. Admin retrain service command
+
+Admin-вход находится в:
+
+online/trading/service_status.py
+
+Команда локального Windows/admin-запуска:
+
+python -m online.trading.service_status retrain-candidate-expanded-local 
+--symbols BTCUSDT,ETHUSDT 
+--start "2024-01-01 00:00:00" 
+--end "2026-06-29 15:30:00" 
+--train-end "2026-04-30 15:30:00" 
+--valid-start "2026-04-30 15:30:00" 
+--valid-end "2026-06-29 15:30:00" 
+--run-tag debug_service_retrain_candidate_full_plan_only 
+--full-candidate-retrain
+
+Этот вариант строит только plan-only.
+
+Он не запускает обучение, потому что нет флага:
+
+--execute
+
+Для реального запуска полного candidate retrain нужен явный запуск:
+
+python -m online.trading.service_status retrain-candidate-expanded-local 
+--symbols BTCUSDT,ETHUSDT 
+--start "2024-01-01 00:00:00" 
+--end "2026-06-29 15:30:00" 
+--train-end "2026-04-30 15:30:00" 
+--valid-start "2026-04-30 15:30:00" 
+--valid-end "2026-06-29 15:30:00" 
+--run-tag retrain_candidate_YYYYMMDD_HHMMSS 
+--full-candidate-retrain 
+--execute
+
+Запуск через Telegram для admin retrain не используется.
+
+Это системная/admin-команда, а не пользовательский Telegram flow.
+
+Контрольные safety-проверки:
+
+1. candidate_retrain default:
+
+enabled_steps = []
+
+2. full candidate retrain без execute:
+
+status = PLAN_ONLY
+offline_executor_status = NOT_RUN
+
+3. execute без full flag:
+
+RuntimeError: --execute is forbidden without --full-candidate-retrain
+
+4. full candidate retrain с execute:
+
+enabled_steps содержит полный train pipeline,
+offline executor запускается,
+outputs пишутся только в candidate paths.
+
+⸻
+
+37. Promotion candidate-моделей
+
+Candidate retrain сам по себе не означает замену production-моделей.
+
+Правильный порядок:
+
+1. Построить candidate models.
+2. Провести backtest candidate-моделей.
+3. Сравнить с текущим production baseline.
+4. Проверить комиссии, slippage, drawdown, PF, winrate, number of trades.
+5. Проверить отсутствие leakage.
+6. Проверить стабильность по символам.
+7. Только после этого выполнить controlled promotion.
+
+Promotion должен быть отдельным действием.
+
+Promotion не должен быть побочным эффектом retrain.
+
+Идеальная схема promotion:
+
+candidate models
+↓
+candidate backtest
+↓
+comparison report
+↓
+manual/admin approval
+↓
+registry update
+↓
+online pipeline uses new model paths
+
+Критический принцип:
+
+retrain создаёт кандидата,
+но не делает его production.
+
+⸻
+
+38. Обновлённый смысл production-гибкости
+
+После добавления add-symbol и admin retrain проект стал гибким production ML-pipeline.
+
+Теперь система умеет:
+
+* добавлять новый символ без ручного пересоздания всех артефактов;
+* проверять новый символ на OOS-периоде;
+* доводить новый символ до online_gate5_3_decisions;
+* запускать посимвольный backtest;
+* строить candidate-модели на свежих расширенных данных;
+* не перетирать production baseline при retrain;
+* разделять production models и candidate models;
+* запускать обучение только через явные admin-флаги;
+* сохранять audit trail через run_tag и manifests.
+
+Главная инженерная идея:
+
+обычный runtime торгует,
+add-symbol расширяет список инструментов,
+admin-retrain создаёт новых кандидатов моделей,
+promotion отдельно решает, заменять ли production baseline.

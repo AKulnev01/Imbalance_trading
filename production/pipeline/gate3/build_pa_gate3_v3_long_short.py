@@ -1116,15 +1116,15 @@ def build_gate3_v3_long_short(
 def main() -> None:
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--gate1_root", type=str, default="production/dataset/gate1")
-    ap.add_argument("--h4_root", type=str, default="data/h4_3")
-    ap.add_argument("--out_root", type=str, default="production/dataset")
-    ap.add_argument("--context_bars", type=int, default=96)
+    ap.add_argument("--gate1-root", "--gate1_root", type=str, default="production/dataset/gate1")
+    ap.add_argument("--h4-root", "--h4_root", type=str, default="data/h4_3")
+    ap.add_argument("--out-root", "--out_root", type=str, default="production/dataset")
+    ap.add_argument("--context-bars", "--context_bars", type=int, default=96)
 
-    ap.add_argument("--active_max_bars", type=int, default=6)
-    ap.add_argument("--active_stop_atr_mult", type=float, default=1.25)
+    ap.add_argument("--active-max-bars", "--active_max_bars", type=int, default=6)
+    ap.add_argument("--active-stop-atr-mult", "--active_stop_atr_mult", type=float, default=1.25)
 
-    ap.add_argument("--max_symbols", type=int, default=0)
+    ap.add_argument("--max-symbols", "--max_symbols", type=int, default=0)
     ap.add_argument("--symbols", type=str, default="")
 
     args = ap.parse_args()
